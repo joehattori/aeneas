@@ -21,8 +21,68 @@ set_option maxRecDepth 2048
 namespace names
 
 /-- [names::Struct]
-    Source: 'tests/src/names.rs', lines 3:0-5:1 -/
+    Source: 'tests/src/names.rs', lines 6:0-8:1 -/
 structure Struct where
   «name» : String
+
+/-- [names::push]:
+    Source: 'tests/src/names.rs', lines 11:0-14:1 -/
+def push
+  (alloc1 : Std.U32) (values : alloc.vec.Vec Std.U32) :
+  Result (alloc.vec.Vec Std.U32)
+  := do
+  alloc.vec.Vec.push values alloc1
+
+/-- [names::singleton]:
+    Source: 'tests/src/names.rs', lines 18:0-22:1 -/
+def singleton
+  {alloc1 : Type} (value : alloc1) : Result (alloc.vec.Vec alloc1) := do
+  alloc.vec.Vec.push (alloc.vec.Vec.new alloc1) value
+
+/-- [names::nested::id]:
+    Source: 'tests/src/names.rs', lines 25:4-27:5
+    Visibility: public -/
+def nested.id (value : Std.U32) : Result Std.U32 := do
+  ok value
+
+/-- [names::call_nested]:
+    Source: 'tests/src/names.rs', lines 31:0-33:1 -/
+def call_nested (nested1 : Std.U32) : Result Std.U32 := do
+  nested.id nested1
+
+/-- [names::local_nested]:
+    Source: 'tests/src/names.rs', lines 35:0-38:1 -/
+def local_nested (value : Std.U32) : Result Std.U32 := do
+  let nested1 ← nested.id value
+  nested.id nested1
+
+/-- [names::const_namespace]:
+    Source: 'tests/src/names.rs', lines 42:0-44:1 -/
+def const_namespace
+  {Std1 : Std.Usize} (values : Array Std.U32 Std1) : Result Std.U32 := do
+  Array.index_usize values 0#usize
+
+/-- [names::namespace_collisions]:
+    Source: 'tests/src/names.rs', lines 47:0-54:1 -/
+def namespace_collisions : Result Unit := do
+  let v ← singleton 1#u32
+  let values ← push 2#u32 v
+  let i ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32) values
+      0#usize
+  massert (i = 1#u32)
+  let i1 ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32) values
+      1#usize
+  massert (i1 = 2#u32)
+  let i2 ← call_nested 3#u32
+  massert (i2 = 3#u32)
+  let i3 ← local_nested 4#u32
+  massert (i3 = 4#u32)
+  let i4 ← const_namespace (Array.make 1#usize [ 5#u32 ])
+  massert (i4 = 5#u32)
+
+/- Unit test for [names::namespace_collisions] -/
+#guard (namespace_collisions).reducesTo ()
 
 end names
