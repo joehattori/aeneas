@@ -350,6 +350,10 @@ let basename_to_unique_aux (collision : string -> bool)
   if collision basename then gen 1 else basename
 
 type names_maps = {
+  namespace_roots : StringSet.t;
+      (** Roots of qualified Lean names, reserved for local variables only. For
+          example, a local [alloc] would shadow [alloc.vec.Vec.push], even
+          though it does not collide with the complete function name. *)
   names_map : names_map;
       (** The map for id to names, where we forbid name collisions (ex.: we
           always forbid function name collisions). *)
@@ -407,10 +411,23 @@ let allow_collisions (id : id) : bool =
       true
   | _ -> false
 
+(** Reserve the root of a qualified name to prevent local Lean binders from
+    shadowing it. This does not forbid declarations from sharing namespaces. *)
+let reserve_namespace_root (name : string) (roots : StringSet.t) : StringSet.t =
+  match backend () with
+  | Lean -> (
+      match String.index_opt name '.' with
+      | Some i -> StringSet.add (String.sub name 0 i) roots
+      | None -> roots)
+  | FStar | Coq | HOL4 -> roots
+
 (** The [id_to_string] function to print nice debugging messages if there are
     collisions *)
 let names_maps_add (id_to_string : id -> string) (id : id)
     (span : Meta.span option) (name : string) (nm : names_maps) : names_maps =
+  let nm =
+    { nm with namespace_roots = reserve_namespace_root name nm.namespace_roots }
+  in
   (* We do not use the same name map if we allow/disallow collisions.
      We notably use it for field names: some backends like Lean can use the
      type information to disambiguate field projections.
@@ -1322,6 +1339,10 @@ let initialize_names_maps () : names_maps =
   in
   let nm =
     {
+      namespace_roots =
+        List.fold_left
+          (fun roots name -> reserve_namespace_root name roots)
+          StringSet.empty keywords;
       names_map;
       unsafe_names_map;
       strict_names_map;
@@ -2122,6 +2143,7 @@ let basename_to_unique (ctx : extraction_ctx) (name : string) =
        the backend allows such collisions *)
     StringSet.mem s ctx.names_maps.names_map.names_set
     || StringSet.mem s ctx.names_maps.strict_names_map.names_set
+    || StringSet.mem s ctx.names_maps.namespace_roots
   in
   basename_to_unique_aux collision name_append_index name
 
