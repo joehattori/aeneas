@@ -227,6 +227,13 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
             self#visit_tavalue (abs, pm) child
         | AEndedMutBorrow _ | AEndedSharedBorrow -> [%craise] span "Unreachable"
 
+      method! visit_borrow_content (abs, pm) bc =
+        (* Shared values inside ASharedLoan may themselves contain shared
+           borrows. Keep both borrow identifiers when registering them. *)
+        match bc with
+        | VSharedBorrow (bid, sid) -> register_borrow_id abs pm bid (Some sid)
+        | _ -> super#visit_borrow_content (abs, pm) bc
+
       method! visit_borrow_id _ _ = [%internal_error] span
       method! visit_loan_id (abs, pm) lid = register_loan_id abs pm lid
 
