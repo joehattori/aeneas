@@ -147,4 +147,104 @@ def test_fits : Result Unit := do
 /- Unit test for [shared_loan_join::test_fits] -/
 #guard (test_fits).reducesTo ()
 
+/-- [shared_loan_join::ResultSet]
+    Source: 'tests/src/shared_loan_join.rs', lines 48:0-50:1
+    Visibility: public -/
+structure ResultSet where
+  results : Slice (core.result.Result Std.U64 Std.U64)
+
+/-- [shared_loan_join::{shared_loan_join::ResultSet<'_0>}::first_success]: loop body 0:
+    Source: 'tests/src/shared_loan_join.rs', lines 55:8-62:5
+    Visibility: public -/
+@[rust_loop_body]
+def ResultSet.first_success_loop.body
+  (iter : core.slice.iter.Iter (core.result.Result Std.U64 Std.U64))
+  (last : core.result.Result Std.U64 Std.U64) :
+  Result (ControlFlow ((core.slice.iter.Iter (core.result.Result Std.U64
+    Std.U64)) × (core.result.Result Std.U64 Std.U64)) (core.result.Result
+    Std.U64 Std.U64))
+  := do
+  let (o, iter1) ← core.slice.iter.IteratorSliceIter.next iter
+  match o with
+  | none => ok (done last)
+  | some result =>
+    let b ← core.result.Result.is_ok result
+    if b
+    then ok (done result)
+    else ok (cont (iter1, result))
+
+/-- [shared_loan_join::{shared_loan_join::ResultSet<'_0>}::first_success]: loop 0:
+    Source: 'tests/src/shared_loan_join.rs', lines 55:8-62:5
+    Visibility: public -/
+@[rust_loop]
+def ResultSet.first_success_loop
+  (iter : core.slice.iter.Iter (core.result.Result Std.U64 Std.U64))
+  (last : core.result.Result Std.U64 Std.U64) :
+  Result (core.result.Result Std.U64 Std.U64)
+  := do
+  loop
+    (fun (iter1, last1) => ResultSet.first_success_loop.body iter1 last1)
+    (iter, last)
+
+/-- [shared_loan_join::{shared_loan_join::ResultSet<'_0>}::first_success]:
+    Source: 'tests/src/shared_loan_join.rs', lines 53:4-62:5
+    Visibility: public -/
+def ResultSet.first_success
+  (self : ResultSet) : Result (core.result.Result Std.U64 Std.U64) := do
+  let iter ← core.slice.Slice.iter self.results
+  ResultSet.first_success_loop iter (core.result.Result.Err 0#u64)
+
+/-- [shared_loan_join::expect_ok]:
+    Source: 'tests/src/shared_loan_join.rs', lines 65:0-70:1 -/
+def expect_ok
+  (result : core.result.Result Std.U64 Std.U64) (expected : Std.U64) :
+  Result Unit
+  := do
+  match result with
+  | core.result.Result.Ok value => massert (value = expected)
+  | core.result.Result.Err _ => fail panic
+
+/-- [shared_loan_join::expect_err]:
+    Source: 'tests/src/shared_loan_join.rs', lines 72:0-77:1 -/
+def expect_err
+  (result : core.result.Result Std.U64 Std.U64) (expected : Std.U64) :
+  Result Unit
+  := do
+  match result with
+  | core.result.Result.Ok _ => fail panic
+  | core.result.Result.Err error => massert (error = expected)
+
+/-- [shared_loan_join::test_first_success]:
+    Source: 'tests/src/shared_loan_join.rs', lines 81:0-112:1
+    Visibility: public -/
+def test_first_success : Result Unit := do
+  let (s, _) ←
+    lift (Array.to_slice_mut
+      (Std.Array.empty (core.result.Result Std.U64 Std.U64)))
+  let r ← ResultSet.first_success { results := s }
+  expect_err r 0#u64
+  let (s1, _) ←
+    lift (Array.to_slice_mut
+      (Array.make 2#usize [
+        core.result.Result.Err 1#u64, core.result.Result.Err 2#u64
+        ]))
+  let r1 ← ResultSet.first_success { results := s1 }
+  expect_err r1 2#u64
+  let (s2, to_slice_mut_back) ←
+    lift (Array.to_slice_mut
+      (Array.make 3#usize [
+        core.result.Result.Err 1#u64, core.result.Result.Ok 42#u64,
+        core.result.Result.Ok 7#u64
+        ]))
+  let r2 ← ResultSet.first_success { results := s2 }
+  expect_ok r2 42#u64
+  let results := to_slice_mut_back s2
+  let results1 ← Array.update results 1#usize (core.result.Result.Ok 8#u64)
+  let (s3, _) ← lift (Array.to_slice_mut results1)
+  let r3 ← ResultSet.first_success { results := s3 }
+  expect_ok r3 8#u64
+
+/- Unit test for [shared_loan_join::test_first_success] -/
+#guard (test_first_success).reducesTo ()
+
 end shared_loan_join
