@@ -218,8 +218,14 @@ let reborrow_ashared_loans (span : Meta.span) (loop_id : LoopId.id option)
             (* Do nothing *)
             super#visit_VSharedBorrow env bid sid
         | Some (abs, sv, rty) ->
-            (* Check if the region abstraction is frozen *)
-            if not abs.can_end then
+            (* Reborrowing copies the shared value. Mutable borrows nested
+               inside it cannot be duplicated: keep using the original frozen
+               loan in that case. Its contents cannot change through the
+               shared borrow. *)
+            if
+              (not abs.can_end)
+              && not (value_has_mut_borrows (Some span) ctx sv.value)
+            then
               let bid, sid = push_abs_for_shared_value abs sv rty bid sid in
               VSharedBorrow (bid, sid)
             else super#visit_VSharedBorrow env bid sid
