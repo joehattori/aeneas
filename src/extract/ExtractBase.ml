@@ -813,8 +813,40 @@ let escape_name ?(qualified : bool = false) (name : string) : string =
 let ctx_add (span : Meta.span) (id : id) (name : string) (ctx : extraction_ctx)
     : extraction_ctx =
   let id_to_string (id : id) : string = id_to_string (Some span) id ctx in
+  (* Different Rust instantiations may refer to the same external
+     model. These are references, not competing declarations. Still reject
+     collisions with generated declarations and reserved names. *)
+  let builtin_reference = function
+    | TraitDeclId tid | TraitDeclConstructorId tid ->
+        Option.fold ~none:false
+          ~some:(fun (decl : trait_decl) -> Option.is_some decl.builtin_info)
+          (TraitDeclId.Map.find_opt tid ctx.trans_trait_decls)
+    | FunId (FromLlbc (Pure.FunId fid, None)) ->
+        Option.fold ~none:false
+          ~some:(fun decl -> Option.is_some decl.f.builtin_info)
+          (FunDeclId.Map.find_opt fid ctx.trans_funs)
+    | _ -> false
+  in
+  let same_kind left right =
+    match (left, right) with
+    | TraitDeclId _, TraitDeclId _
+    | TraitDeclConstructorId _, TraitDeclConstructorId _
+    | FunId _, FunId _ -> true
+    | _ -> false
+  in
   let names_maps =
-    names_maps_add id_to_string id (Some span) name ctx.names_maps
+    match names_map_get_id_from_name name ctx.names_maps.names_map with
+    | Some (previous, _)
+      when same_kind id previous && builtin_reference id
+           && builtin_reference previous ->
+        let names_map =
+          {
+            ctx.names_maps.names_map with
+            id_to_name = IdMap.add id name ctx.names_maps.names_map.id_to_name;
+          }
+        in
+        { ctx.names_maps with names_map }
+    | _ -> names_maps_add id_to_string id (Some span) name ctx.names_maps
   in
   { ctx with names_maps }
 
@@ -2416,8 +2448,16 @@ let ctx_compute_fun_global_name_no_suffix (item_meta : T.item_meta)
         if is_trait_decl_field then llbc_name
         else
           match src with
-          | TraitDefaultSource ->
-              llbc_name @ [ PeIdent ("default", Disambiguator.zero) ]
+          | TraitDefaultSource -> (
+              (* Keep instantiation metadata at the end: name generation uses
+                 it to distinguish specialized default methods. *)
+              let suffix : T.path_elem =
+                PeIdent ("default", Disambiguator.zero)
+              in
+              match List.rev llbc_name with
+              | (PeInstantiated _ as inst) :: rest ->
+                  List.rev rest @ [ suffix; inst ]
+              | _ -> llbc_name @ [ suffix ])
           | _ -> llbc_name
       in
       [%ldebug

@@ -166,7 +166,14 @@ let pattern_to_trait_impl_extract_name = pattern_to_extract_name None
    consistent with the extraction names we derive from the Rust names *)
 let name_to_simple_name (ctx : ctx) (n : Types.name) : string list =
   let c = default_to_pat_config in
-  pattern_to_extract_name None (name_to_pattern ctx c n)
+  let pattern =
+    match List.rev n with
+    | Types.PeInstantiated binder :: rest ->
+        name_with_generics_to_pattern ctx c binder.binder_params (List.rev rest)
+          binder.binder_value
+    | _ -> name_to_pattern ctx c n
+  in
+  pattern_to_extract_name None pattern
 
 (** If the [prefix] is Some, we attempt to remove the common prefix between
     [prefix] and [name] from [name] *)
