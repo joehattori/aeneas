@@ -1886,101 +1886,97 @@ let simplify_trait_calls (crate : crate) : crate =
   in
   let crate = visitor#visit_crate None crate in
 
-  (* Re-compute the set of used trait impls and fun declarations: by simplifying
-     the calls we may have filtered some annoying ones
+  (* Follow dependencies from local declarations and transparent bodies after
+     simplifying calls. In particular, the blanket [IntoIterator::into_iter]
+     call no longer keeps its iterator implementation alive. Do not root every
+     foreign trait's default methods: with partial monomorphization this keeps
+     otherwise unused mutable-reference specializations and their traits alive.
 
-     Remark: the way we explore the crate is slightly approximative below.
-     We should improve it.
-  *)
+     Only filter declaration groups, keeping the maps available for name and
+     source metadata lookup. A function's source and item name are not semantic
+     dependencies on its enclosing trait implementation. *)
   let used_impls = ref TraitImplId.Set.empty in
-  let impls_to_explore = ref [] in
+  let used_traits = ref TraitDeclId.Set.empty in
   let used_funs = ref FunDeclId.Set.empty in
-
-  (* First explore the transparent functions *)
+  let pending = Queue.create () in
   let visitor =
     object
-      inherit [_] iter_statement
+      inherit [_] iter_crate
+      method! visit_item_meta _ _ = ()
+      method! visit_fun_source _ _ = ()
 
       method! visit_trait_impl_id _ id =
         if not (TraitImplId.Set.mem id !used_impls) then (
           used_impls := TraitImplId.Set.add id !used_impls;
-          impls_to_explore := id :: !impls_to_explore)
+          Queue.add (IdTraitImpl id) pending)
+
+      method! visit_trait_decl_id _ id =
+        if not (TraitDeclId.Set.mem id !used_traits) then (
+          used_traits := TraitDeclId.Set.add id !used_traits;
+          Queue.add (IdTraitDecl id) pending)
 
       method! visit_fun_decl_id _ id =
-        used_funs := FunDeclId.Set.add id !used_funs
+        if not (FunDeclId.Set.mem id !used_funs) then (
+          used_funs := FunDeclId.Set.add id !used_funs;
+          Queue.add (IdFun id) pending)
     end
   in
   FunDeclId.Map.iter
     (fun _ (f : fun_decl) ->
       if f.item_meta.is_local then visitor#visit_fun_decl_id () f.def_id;
       match f.body with
-      | StructuredBody body -> visitor#visit_block () body.body
+      | StructuredBody body -> visitor#visit_expr_body () body
       | TargetDispatchBody targets ->
           List.iter
             (fun ((_ : string), (fdr : Types.fun_decl_ref)) ->
-              visitor#visit_fun_decl_id () fdr.id)
+              visitor#visit_fun_decl_ref () fdr)
             targets
       | _ -> ())
     crate.fun_decls;
-
+  TypeDeclId.Map.iter (fun _ -> visitor#visit_type_decl ()) crate.type_decls;
   GlobalDeclId.Map.iter
-    (fun _ (d : global_decl) -> visitor#visit_constant_expr () d.value)
+    (fun _ -> visitor#visit_global_decl ())
     crate.global_decls;
-
   TraitDeclId.Map.iter
     (fun _ (d : trait_decl) ->
-      TraitMethodId.Map.iter
-        (fun _ (d : trait_method binder) ->
-          Option.iter
-            (fun (default : fun_decl_ref) ->
-              visitor#visit_fun_decl_id () default.id)
-            d.binder_value.default)
-        d.methods)
+      if d.item_meta.is_local then visitor#visit_trait_decl_id () d.def_id)
     crate.trait_decls;
-
-  (* Add the local trait impls *)
   TraitImplId.Map.iter
     (fun _ (d : trait_impl) ->
       if d.item_meta.is_local then visitor#visit_trait_impl_id () d.def_id)
     crate.trait_impls;
-
-  (* Explore the impls *)
-  while !impls_to_explore <> [] do
-    let id = List.hd !impls_to_explore in
-    impls_to_explore := List.tl !impls_to_explore;
-    match TraitImplId.Map.find_opt id crate.trait_impls with
-    | None -> ()
-    | Some impl ->
-        List.iter
-          (visitor#visit_region_binder visitor#visit_trait_ref ())
-          impl.implied_trait_refs;
-        TraitMethodId.Map.iter
-          (fun _ (x : fun_decl_ref binder) ->
-            visitor#visit_fun_decl_id () x.binder_value.id)
-          impl.methods
+  while not (Queue.is_empty pending) do
+    match Queue.take pending with
+    | IdFun id ->
+        Option.iter
+          (visitor#visit_fun_decl ())
+          (FunDeclId.Map.find_opt id crate.fun_decls)
+    | IdTraitDecl id ->
+        Option.iter
+          (visitor#visit_trait_decl ())
+          (TraitDeclId.Map.find_opt id crate.trait_decls)
+    | IdTraitImpl id ->
+        Option.iter
+          (visitor#visit_trait_impl ())
+          (TraitImplId.Map.find_opt id crate.trait_impls)
+    | _ -> [%internal_error_opt_span] None
   done;
-
-  (* Filter the declaration groups we want to extract *)
   let keep_group (gr : declaration_group) : bool =
     match gr with
-    | TraitImplGroup (NonRecGroup id) ->
-        if TraitImplId.Set.mem id !used_impls then true else false
+    | TraitImplGroup (NonRecGroup id) -> TraitImplId.Set.mem id !used_impls
     | TraitImplGroup (RecGroup ids) ->
-        if List.exists (fun id -> TraitImplId.Set.mem id !used_impls) ids then
-          true
-        else false
-    | FunGroup (NonRecGroup id) ->
-        if FunDeclId.Set.mem id !used_funs then true else false
+        List.exists (fun id -> TraitImplId.Set.mem id !used_impls) ids
+    | TraitDeclGroup (NonRecGroup id) -> TraitDeclId.Set.mem id !used_traits
+    | TraitDeclGroup (RecGroup ids) ->
+        List.exists (fun id -> TraitDeclId.Set.mem id !used_traits) ids
+    | FunGroup (NonRecGroup id) -> FunDeclId.Set.mem id !used_funs
     | FunGroup (RecGroup ids) ->
-        if List.exists (fun id -> FunDeclId.Set.mem id !used_funs) ids then true
-        else false
+        List.exists (fun id -> FunDeclId.Set.mem id !used_funs) ids
     | _ -> true
   in
   let declarations =
     Some (List.filter keep_group (Option.get crate.declarations))
   in
-
-  (* *)
   { crate with declarations }
 
 (** Repair the return lifetime of closure trait implementations.
