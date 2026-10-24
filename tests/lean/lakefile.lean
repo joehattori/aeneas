@@ -109,6 +109,7 @@ package «tests» {}
 @[default_target] lean_lib SharedLoanJoin
 @[default_target] lean_lib SharedMutLoop
 @[default_target] lean_lib Slices
+@[default_target] lean_lib SpecializedIteratorNames
 @[default_target] lean_lib Static
 @[default_target] lean_lib StepBy
 @[default_target] lean_lib StepOverflowing
