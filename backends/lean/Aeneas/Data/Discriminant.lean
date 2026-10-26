@@ -130,7 +130,11 @@ meta def generateReadDiscriminantCmds (declName : Name) (ty : ScalarTy) (discrVa
   -- Generate the syntax for the instance
   let binders := binders.extract 0 indVal.numParams
   let args := header.argNames.map mkIdent
-  let instStx ← `(@[expose] public instance $binders:bracketedBinder* :
+  -- Attribute elaboration does not retain the inductive's namespace. Anonymous
+  -- instance names can therefore collide when separately compiled modules are
+  -- imported together (for example, two enums named Error).
+  let instName := `_root_ ++ Name.mkStr declName "instDiscriminant"
+  let instStx ← `(@[expose] public instance $(mkIdent instName):ident $binders:bracketedBinder* :
       Aeneas.Std.Discriminant ($header.targetType) ($ty) where
       read_discriminant := @$(mkIdent auxFunName):ident $args*)
 
@@ -217,6 +221,24 @@ namespace Test
   #guard read_discriminant Foo2.Variant1 = 0#i16
   #guard read_discriminant Foo3.Variant1 = 3#isize
   #guard read_discriminant Foo3.Variant2 = 4#isize
+
+  -- Keep instance names qualified, including for parameterized enums, so that
+  -- declarations with the same short name can coexist across modules.
+  inductive First.Error where
+  | Failed
+
+  inductive Second.Error (α : Type) where
+  | Empty
+  | Failed (value : α)
+
+  #eval generateReadDiscriminant ``First.Error .Isize none
+  #eval generateReadDiscriminant ``Second.Error .Isize none
+
+  example : Discriminant First.Error Isize := First.Error.instDiscriminant
+  example {α : Type} : Discriminant (Second.Error α) Isize := Second.Error.instDiscriminant
+
+  #guard read_discriminant First.Error.Failed = 0#isize
+  #guard read_discriminant (Second.Error.Failed 42) = 1#isize
 
 end Test
 
