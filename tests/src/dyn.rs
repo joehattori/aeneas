@@ -1,4 +1,6 @@
 //@ [!lean] skip
+#![feature(register_tool)]
+#![register_tool(verify)]
 
 trait Trait {
     fn get(&self) -> u32;
@@ -49,4 +51,53 @@ trait Trivial {}
 
 fn dyn_closure(_: impl Trivial) {
     let f = |x: u32| -> u32 { x };
+}
+
+// A shared trait object stored inside an ADT, as in MemoryMappingBuilder.
+struct DynBuilder<'a> {
+    source: Option<&'a dyn Trait>,
+    is_u32: bool,
+    offset: u64,
+}
+
+impl<'a> DynBuilder<'a> {
+    fn new() -> Self {
+        Self {
+            source: None,
+            is_u32: false,
+            offset: 0,
+        }
+    }
+
+    fn from_u32(mut self, source: &'a u32) -> Self {
+        self.is_u32 = true;
+        self.source = Some(source as &dyn Trait);
+        self
+    }
+
+    fn from_bool(mut self, source: &'a bool) -> Self {
+        self.source = Some(source as &dyn Trait);
+        self
+    }
+
+    fn offset(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
+    }
+}
+
+#[verify::test]
+fn dyn_builder_configuration() {
+    let number = 42;
+    let flag = false;
+    let builder = DynBuilder::new()
+        .from_u32(&number)
+        .from_bool(&flag)
+        .offset(7);
+    match builder.source {
+        Some(_) => (),
+        None => panic!(),
+    }
+    assert!(builder.is_u32);
+    assert!(builder.offset == 7);
 }
