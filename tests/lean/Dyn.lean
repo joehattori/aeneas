@@ -10,7 +10,6 @@ set_option linter.unusedVariables false
 set_option linter.style.whitespace false
 set_option linter.style.setOption false
 set_option linter.style.longLine false
-set_option linter.internalConstructors false
 
 /- You can set the `maxHeartbeats` value with the `-max-heartbeats` CLI option -/
 set_option maxHeartbeats 1000000
@@ -21,56 +20,56 @@ set_option maxRecDepth 2048
 namespace dyn
 
 /-- Trait declaration: [dyn::Trait]
-    Source: 'tests/src/dyn.rs', lines 3:0-5:1 -/
-structure Trait (Self : Type _) where
+    Source: 'tests/src/dyn.rs', lines 5:0-7:1 -/
+structure Trait (Self : Type) where
   get : Self → Result Std.U32
 
 /-- [dyn::{impl dyn::Trait for u32}::get]:
-    Source: 'tests/src/dyn.rs', lines 8:4-10:5 -/
+    Source: 'tests/src/dyn.rs', lines 10:4-12:5 -/
 def U32.Insts.DynTrait.get (self : Std.U32) : Result Std.U32 := do
   ok self
 
 /-- Trait implementation: [dyn::{impl dyn::Trait for u32}]
-    Source: 'tests/src/dyn.rs', lines 7:0-11:1 -/
+    Source: 'tests/src/dyn.rs', lines 9:0-13:1 -/
 @[reducible]
 def U32.Insts.DynTrait : Trait Std.U32 := {
   get := U32.Insts.DynTrait.get
 }
 
 /-- [dyn::{impl dyn::Trait for bool}::get]:
-    Source: 'tests/src/dyn.rs', lines 14:4-16:5 -/
+    Source: 'tests/src/dyn.rs', lines 16:4-18:5 -/
 def Bool.Insts.DynTrait.get (self : Bool) : Result Std.U32 := do
   ok (UScalar.cast_fromBool .U32 self)
 
 /-- Trait implementation: [dyn::{impl dyn::Trait for bool}]
-    Source: 'tests/src/dyn.rs', lines 13:0-17:1 -/
+    Source: 'tests/src/dyn.rs', lines 15:0-19:1 -/
 @[reducible]
 def Bool.Insts.DynTrait : Trait Bool := {
   get := Bool.Insts.DynTrait.get
 }
 
 /-- [dyn::bool_to_trait]:
-    Source: 'tests/src/dyn.rs', lines 19:0-21:1 -/
+    Source: 'tests/src/dyn.rs', lines 21:0-23:1 -/
 def bool_to_trait (b : Bool) : Result Bool := do
   ok b
 
 /-- [dyn::mk_trait]:
-    Source: 'tests/src/dyn.rs', lines 23:0-29:1 -/
+    Source: 'tests/src/dyn.rs', lines 25:0-31:1 -/
 def mk_trait (b : Bool) : Result (Dyn (fun _dyn => Trait _dyn)) := do
   if b
   then ok (Dyn.mk _ Bool.Insts.DynTrait b)
   else ok (Dyn.mk _ U32.Insts.DynTrait 0#u32)
 
 /-- Trait declaration: [dyn::Into]
-    Source: 'tests/src/dyn.rs', lines 31:0-33:1 -/
-structure Into (Self : Type _) (T : Type _) where
+    Source: 'tests/src/dyn.rs', lines 33:0-35:1 -/
+structure Into (Self : Type) (T : Type) where
   into : Self → Result T
 
 /-- [dyn::mk_into]:
-    Source: 'tests/src/dyn.rs', lines 36:0-46:1 -/
+    Source: 'tests/src/dyn.rs', lines 38:0-48:1 -/
 def mk_into
-  (U : Type _) {V : Type _} {T : Type _} {W : Type _} (IntoInst : Into T V)
-  (IntoInst1 : Into W V) (b : Bool) (x : T) (y : W) :
+  (U : Type) {V : Type} {T : Type} {W : Type} (IntoInst : Into T V) (IntoInst1
+  : Into W V) (b : Bool) (x : T) (y : W) :
   Result (Dyn (fun _dyn => Into _dyn V))
   := do
   if b
@@ -78,27 +77,65 @@ def mk_into
   else ok (Dyn.mk _ IntoInst1 y)
 
 /-- Trait declaration: [dyn::Trivial]
-    Source: 'tests/src/dyn.rs', lines 48:0-48:16 -/
-structure Trivial (Self : Type _) where
+    Source: 'tests/src/dyn.rs', lines 50:0-50:16 -/
+structure Trivial (Self : Type) where
 
 /-- [dyn::dyn_closure::{closure}]
-    Source: 'tests/src/dyn.rs', lines 51:12-51:33 -/
+    Source: 'tests/src/dyn.rs', lines 53:12-53:33 -/
 @[reducible]
-def dyn_closure.closure (T0 : Type _) := Unit
+def dyn_closure.closure (T0 : Type) := Unit
 
 /-- [dyn::dyn_closure]:
-    Source: 'tests/src/dyn.rs', lines 50:0-52:1 -/
+    Source: 'tests/src/dyn.rs', lines 52:0-54:1 -/
 def dyn_closure
-  {T0 : Type _} (TrivialInst : Trivial T0) (t : T0) : Result Unit := do
+  {T0 : Type} (TrivialInst : Trivial T0) (t : T0) : Result Unit := do
   ok ()
 
-/-- [dyn::dyn_closure::{impl core::ops::function::Fn<(u32,), u32> for dyn::dyn_closure::{closure}<T0>}::call]:
-    Source: 'tests/src/dyn.rs', lines 51:12-51:33 -/
-def dyn_closure.closure.Insts.CoreOpsFunctionFnTupleU32U32.call
-  {T0 : Type _} (TrivialInst : Trivial T0) (c : dyn_closure.closure T0)
-  (tupled_args : Std.U32) :
-  Result Std.U32
-  := do
-  ok tupled_args
+/-- [dyn::DynBuilder]
+    Source: 'tests/src/dyn.rs', lines 57:0-61:1 -/
+structure DynBuilder where
+  source : Option (Dyn (fun _dyn => Trait _dyn))
+  is_u32 : Bool
+  offset : Std.U64
+
+/-- [dyn::{dyn::DynBuilder<'a>}::new]:
+    Source: 'tests/src/dyn.rs', lines 64:4-70:5 -/
+def DynBuilder.new : Result DynBuilder := do
+  ok { source := none, is_u32 := false, offset := 0#u64 }
+
+/-- [dyn::{dyn::DynBuilder<'a>}::from_u32]:
+    Source: 'tests/src/dyn.rs', lines 72:4-76:5 -/
+def DynBuilder.from_u32
+  (self : DynBuilder) (source : Std.U32) : Result DynBuilder := do
+  let source1 := Dyn.mk _ U32.Insts.DynTrait source
+  ok { self with source := (some source1), is_u32 := true }
+
+/-- [dyn::{dyn::DynBuilder<'a>}::from_bool]:
+    Source: 'tests/src/dyn.rs', lines 78:4-81:5 -/
+def DynBuilder.from_bool
+  (self : DynBuilder) (source : Bool) : Result DynBuilder := do
+  let source1 := Dyn.mk _ Bool.Insts.DynTrait source
+  ok { self with source := (some source1) }
+
+/-- [dyn::{dyn::DynBuilder<'a>}::offset]:
+    Source: 'tests/src/dyn.rs', lines 83:4-86:5 -/
+def DynBuilder.impl.offset
+  (self : DynBuilder) (offset : Std.U64) : Result DynBuilder := do
+  ok { self with offset }
+
+/-- [dyn::dyn_builder_configuration]:
+    Source: 'tests/src/dyn.rs', lines 90:0-103:1 -/
+def dyn_builder_configuration : Result Unit := do
+  let db ← DynBuilder.new
+  let db1 ← DynBuilder.from_u32 db 42#u32
+  let db2 ← DynBuilder.from_bool db1 false
+  let builder ← DynBuilder.impl.offset db2 7#u64
+  match builder.source with
+  | none => fail panic
+  | some _ => massert builder.is_u32
+              massert (builder.offset = 7#u64)
+
+/- Unit test for [dyn::dyn_builder_configuration] -/
+#guard (dyn_builder_configuration).reducesTo ()
 
 end dyn

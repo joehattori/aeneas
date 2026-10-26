@@ -967,7 +967,12 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
       [%cassert] span (ty1 = ty0)
         "Unsized cast between dynamic traits: unimplemented case";
       [%cassert] span
-        (not (tvalue_has_borrows (Some span) ctx v))
+        (match ty0 with
+        | TRef (_, TDynTrait _, RShared) ->
+            (* An identity cast of a shared trait object preserves the existing
+               borrow and its loan; no new borrow or abstraction is needed. *)
+            true
+        | _ -> not (tvalue_has_borrows (Some span) ctx v))
         "Unsized cast between dynamic traits: unimplemented case";
 
       (* Nothing to do: the cast is the identity *)

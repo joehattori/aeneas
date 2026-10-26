@@ -1886,8 +1886,9 @@ let simplify_trait_calls (crate : crate) : crate =
   in
   let crate = visitor#visit_crate None crate in
 
-  (* Follow dependencies from local declarations and transparent bodies after
-     simplifying calls. In particular, the blanket [IntoIterator::into_iter]
+  (* Follow dependencies from local declarations, explicit entry points, and
+     transparent bodies after simplifying calls. In particular, the blanket
+     [IntoIterator::into_iter]
      call no longer keeps its iterator implementation alive. Do not root every
      foreign trait's default methods: with partial monomorphization this keeps
      otherwise unused mutable-reference specializations and their traits alive.
@@ -1923,7 +1924,8 @@ let simplify_trait_calls (crate : crate) : crate =
   in
   FunDeclId.Map.iter
     (fun _ (f : fun_decl) ->
-      if f.item_meta.is_local then visitor#visit_fun_decl_id () f.def_id;
+      if f.item_meta.is_local || f.item_meta.started_from then
+        visitor#visit_fun_decl_id () f.def_id;
       match f.body with
       | StructuredBody body -> visitor#visit_expr_body () body
       | TargetDispatchBody targets ->
