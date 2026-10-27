@@ -989,12 +989,15 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
         | Neg OPanic, (TScalar (TInteger (Signed _)) as lty) -> lty
         | Neg OPanic, (TScalar (TInteger (Unsigned _)) as lty) -> lty
         | Cast (CastScalar tgt_ty), _ -> TScalar tgt_ty
+        | Cast (CastPtrExposeProvenance tgt_ty), _ -> TScalar (TInteger tgt_ty)
         | Cast (CastUnsize (ty1, _, _)), ty0 ->
             (* If the following function succeeds, then it means the cast is well-formed
            (otherwise it throws an exception) *)
             let _ = cast_unsize_to_modified_fields span ctx ty0 ty1 in
             ty1
-        | Cast (CastRawPtr tgt_ty), _ -> tgt_ty
+        | Cast (CastRawPtr tgt_ty), _
+        | Cast (CastPtrWithExposedProvenance tgt_ty), _ ->
+            tgt_ty
         | _ ->
             [%craise] span
               ("Invalid input for unop: " ^ unop_to_string ctx unop ^ " on "
