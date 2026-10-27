@@ -129,7 +129,7 @@ and translate_trait_ref_kind (span : Meta.span option)
   | ItemClause _ ->
       (* `ItemClause`s are removed by Charon's `--remove-associated-types`, except for GATs *)
       [%craise_opt_span] span "Generic Associated Types are not supported yet"
-  | Dyn -> [%craise_opt_span] span "Dynamic trait types are not supported yet"
+  | Dyn -> Dyn
   | UnknownTrait s -> [%craise_opt_span] span ("Unknown trait found: " ^ s)
 
 (** Translate a signature type - TODO: factor out the different translation
@@ -541,8 +541,7 @@ and compute_back_ty_num_levels (span : Meta.span option)
         save_count outer_regions
     | TFnDef _ | TFnPtr _ ->
         [%craise_opt_span] span "Arrow types are not supported yet"
-    | TDynTrait _ ->
-        [%craise_opt_span] span "Dynamic trait types are not supported yet"
+    | TDynTrait _ -> save_count outer_regions
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
     | _ -> [%craise_opt_span] span ("unsupported type: " ^ T.show_ty ty)
@@ -676,8 +675,7 @@ and translate_back_ty_aux (span : Meta.span option) (decls_ctx : C.decls_ctx)
         stop outer_regions ty
     | TFnDef _ | TFnPtr _ ->
         [%craise_opt_span] span "Arrow types are not supported yet"
-    | TDynTrait _ ->
-        [%craise_opt_span] span "Dynamic trait types are not supported yet"
+    | TDynTrait _ -> stop outer_regions ty
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
     | _ -> [%craise_opt_span] span ("unsupported type: " ^ T.show_ty ty)

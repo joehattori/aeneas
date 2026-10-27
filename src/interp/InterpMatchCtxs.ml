@@ -348,7 +348,12 @@ let rec match_types (span : Meta.span) ~(recover : bool) (ctx0 : eval_ctx)
         "Not the same raw pointer types";
       let ty = match_rec ty0 ty1 in
       TRawPtr (ty, rk0)
-  | TDynTrait _, TDynTrait _ | TFnPtr _, TFnPtr _ | TFnDef _, TFnDef _ ->
+  | TDynTrait dp0, TDynTrait dp1 ->
+      [%cassert_recover] recover span (not Config.use_dyn_regions)
+        "Not implemented yet";
+      [%cassert_recover] recover span (dp0 = dp1) "Not the same dyn traits";
+      ty0
+  | TFnPtr _, TFnPtr _ | TFnDef _, TFnDef _ ->
       [%craise_recover] recover span "Not implemented yet"
   | TPtrMetadata ty0, TPtrMetadata ty1 ->
       let ty = match_rec ty0 ty1 in

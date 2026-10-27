@@ -687,6 +687,7 @@ and trait_instance_id =
     (* Note: the `de_bruijn_id`s are incorrect, see comment on `translate_region_binder` *)
   | ParentClause of trait_instance_id * trait_decl_id * trait_clause_id
   | BuiltinOrAuto of builtin_impl_data
+  | Dyn
   | UnknownTrait of string
 
 and type_id = TAdtId of type_decl_id | TTuple | TBuiltin of builtin_ty
@@ -1220,9 +1221,9 @@ type unop =
 
 and cast_kind =
   | CastLit of literal_type * literal_type
-  | CastRawPtr of (literal_type * mutability) * (literal_type * mutability)
-      (** When casting between raw pointers, we only support a subset of casts
-      *)
+  | CastRawPtr of (ty * mutability) * (ty * mutability)
+  | CastPtrExposeProvenance of (ty * mutability) * integer_type
+  | CastPtrWithExposedProvenance of integer_type * (ty * mutability)
 
 and fn_ptr_kind =
   | FunId of fun_decl_id

@@ -775,7 +775,8 @@ let cast_unsize_to_modified_fields (span : Meta.span) (ctx : eval_ctx)
           snd last_field ))
     else [%craise] span (mk_msg ())
 
-let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
+let eval_unary_op_symbolic ?(dest_ty : ty option) (config : config)
+    (span : Meta.span) (unop : unop)
     (op : operand) (ctx : eval_ctx) :
     (tvalue, eval_error) result
     * eval_ctx
@@ -989,12 +990,22 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
         | Neg OPanic, (TScalar (TInteger (Signed _)) as lty) -> lty
         | Neg OPanic, (TScalar (TInteger (Unsigned _)) as lty) -> lty
         | Cast (CastScalar tgt_ty), _ -> TScalar tgt_ty
+        | Cast CastPtrExposeProvenance, _ -> (
+            (* Charon does not record the integer target type of this cast:
+               it is the type of the assigned place. *)
+            match dest_ty with
+            | Some ty -> ty
+            | None ->
+                [%craise] span
+                  "Pointer-to-address cast without a destination type")
         | Cast (CastUnsize (ty1, _, _)), ty0 ->
             (* If the following function succeeds, then it means the cast is well-formed
            (otherwise it throws an exception) *)
             let _ = cast_unsize_to_modified_fields span ctx ty0 ty1 in
             ty1
-        | Cast (CastRawPtr tgt_ty), _ -> tgt_ty
+        | Cast (CastRawPtr tgt_ty), _
+        | Cast (CastPtrWithExposedProvenance tgt_ty), _ ->
+            tgt_ty
         | _ ->
             [%craise] span
               ("Invalid input for unop: " ^ unop_to_string ctx unop ^ " on "
@@ -1012,14 +1023,15 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
       in
       (res, ctx, cc)
 
-let eval_unary_op (config : config) (span : Meta.span) (unop : unop)
+let eval_unary_op ?(dest_ty : ty option) (config : config) (span : Meta.span)
+    (unop : unop)
     (op : operand) (ctx : eval_ctx) :
     (tvalue, eval_error) result
     * eval_ctx
     * (SymbolicAst.expr -> SymbolicAst.expr) =
   match config.mode with
   | ConcreteMode -> eval_unary_op_concrete config span unop op ctx
-  | SymbolicMode -> eval_unary_op_symbolic config span unop op ctx
+  | SymbolicMode -> eval_unary_op_symbolic ?dest_ty config span unop op ctx
 
 (** Small helper for [eval_binary_op_concrete]: computes the result of applying
     the binop *after* the operands have been successfully evaluated *)
@@ -1481,7 +1493,8 @@ let eval_discriminant (config : config) (span : Meta.span) (p : place)
       (v, ctx, cc_comp cf_read cf_discr)
   | _ -> [%internal_error] span
 
-let eval_rvalue_not_global (config : config) (span : Meta.span)
+let eval_rvalue_not_global ?(dest_ty : ty option) (config : config)
+    (span : Meta.span)
     (rvalue : rvalue) (ctx : eval_ctx) :
     (tvalue, eval_error) result
     * eval_ctx
@@ -1494,7 +1507,7 @@ let eval_rvalue_not_global (config : config) (span : Meta.span)
   | Use (op, _) -> wrap_in_result (eval_operand config span op ctx)
   | RvRef (p, bkind, _) ->
       wrap_in_result (eval_rvalue_ref config span p bkind ctx)
-  | UnaryOp (unop, op) -> eval_unary_op config span unop op ctx
+  | UnaryOp (unop, op) -> eval_unary_op ?dest_ty config span unop op ctx
   | BinaryOp (binop, op1, op2) -> eval_binary_op config span binop op1 op2 ctx
   | Aggregate (aggregate_kind, ops) ->
       wrap_in_result (eval_rvalue_aggregate config span aggregate_kind ops ctx)

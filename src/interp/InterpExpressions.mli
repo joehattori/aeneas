@@ -61,8 +61,12 @@ val eval_operands :
     Transmits the computed rvalue to the received continuation.
 
     Note that this function fails on {!Aeneas.Expressions.rvalue.Discriminant}:
-    discriminant reads should have been eliminated from the AST. *)
+    discriminant reads should have been eliminated from the AST.
+
+    [dest_ty] is the type of the assigned place. It is needed for casts whose
+    target type Charon does not record (pointer-to-address casts). *)
 val eval_rvalue_not_global :
+  ?dest_ty:ty ->
   config ->
   Meta.span ->
   rvalue ->

@@ -391,6 +391,7 @@ and trait_instance_id_to_string (env : fmt_env) (id : trait_instance_id) :
       let clause_id = trait_clause_id_to_string env clause_id in
       "parent(" ^ inst_id ^ ")::" ^ clause_id
   | BuiltinOrAuto data -> builtin_impl_data_to_string data
+  | Dyn -> "Dyn"
   | UnknownTrait msg -> "UNKNOWN(" ^ msg ^ ")"
 
 and trait_clause_to_string (env : fmt_env) (clause : trait_param) : string =
@@ -888,18 +889,20 @@ let regular_fun_id_to_string (env : fmt_env) (fun_id : fun_id) : string =
   | Pure fid -> pure_builtin_fun_id_to_string fid
 
 let cast_kind_to_string (env : fmt_env) (kind : cast_kind) : string =
+  let mk_ptr ty mut =
+    ty_to_string env false
+      (TAdt (TBuiltin (TRawPtr mut), mk_generic_args_from_types [ ty ]))
+  in
   let src, tgt =
     match kind with
     | CastLit (src, tgt) ->
         (literal_type_to_string src, literal_type_to_string tgt)
     | CastRawPtr ((src, src_mut), (tgt, tgt_mut)) ->
-        let mk ty mut =
-          ty_to_string env false
-            (TAdt
-               ( TBuiltin (TRawPtr mut),
-                 mk_generic_args_from_types [ TLiteral ty ] ))
-        in
-        (mk src src_mut, mk tgt tgt_mut)
+        (mk_ptr src src_mut, mk_ptr tgt tgt_mut)
+    | CastPtrExposeProvenance ((src, src_mut), tgt) ->
+        (mk_ptr src src_mut, integer_type_to_string tgt)
+    | CastPtrWithExposedProvenance (src, (tgt, tgt_mut)) ->
+        (integer_type_to_string src, mk_ptr tgt tgt_mut)
   in
   "cast<" ^ src ^ "," ^ tgt ^ ">"
 

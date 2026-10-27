@@ -730,7 +730,7 @@ and extract_trait_instance_id (span : Meta.span) (ctx : extraction_ctx)
       F.pp_print_string fmt name;
       extract_generic_args span ctx fmt no_params_tys generics;
       if inside then F.pp_print_string fmt ")"
-  | UnknownTrait _ ->
+  | Dyn | UnknownTrait _ ->
       (* This is an error case *)
       [%admit_raise] span "Unexpected" fmt
 

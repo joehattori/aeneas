@@ -417,14 +417,19 @@ let extract_cast_kind_hol4 (span : Meta.span)
       extract_expr ~inside:true arg;
       F.pp_print_string fmt ")";
       if inside then F.pp_print_string fmt ")"
-  | CastRawPtr _ ->
+  | CastRawPtr _ | CastPtrExposeProvenance _ | CastPtrWithExposedProvenance _ ->
       [%craise] span "Raw pointer casts are not implemented for HOL4"
 
 (** Extract a cast when the backend is not HOL4 (which receives a special
     treatment) *)
-let extract_cast_kind_gen (span : Meta.span)
+let extract_cast_kind_gen (span : Meta.span) (ctx : extraction_ctx)
     (extract_expr : inside:bool -> texpr -> unit) (fmt : F.formatter)
     ~(inside : bool) (kind : cast_kind) (arg : texpr) : unit =
+  let extract_mut (mut : mutability) : string =
+    match mut with
+    | Mut -> ".Mut"
+    | Const -> ".Const"
+  in
   match kind with
   | CastLit (src, tgt) ->
       let integer_type_to_string (ty : integer_type) : string =
@@ -509,48 +514,55 @@ let extract_cast_kind_gen (span : Meta.span)
         (backend () = Lean)
         "Casts between raw pointers are only supported in the Lean backend";
       if inside then F.pp_print_string fmt "(";
-      (* Print the name of the function *)
-      F.pp_print_string fmt "RawPtr.cast_scalar";
-      (* Print the target type argument and mutability *)
-      let tgt_ty : integer_type =
-        match tgt_ty with
-        | TInt ty -> Signed ty
-        | TUInt ty -> Unsigned ty
-        | _ ->
-            [%craise] span "Can only generate code for casts between integers"
-      in
-      let integer_type_to_string (ty : integer_type) : string =
-        if backend () = Lean then
-          match ty with
-          | Unsigned _ -> "Std." ^ int_name ty
-          | Signed _ -> "Std." ^ int_name ty
-        else
-          StringUtils.capitalize_first_letter
-            (PrintPure.integer_type_to_string ty)
-      in
-      let tgt = integer_type_to_string tgt_ty in
+      F.pp_print_string fmt "RawPtr.cast";
       F.pp_print_space fmt ();
-      F.pp_print_string fmt tgt;
-      let tgt_mut =
-        match tgt_mut with
-        | Mut -> ".Mut"
-        | Const -> ".Const"
-      in
+      extract_ty span ctx fmt TypeDeclId.Set.empty ~inside:true tgt_ty;
       F.pp_print_space fmt ();
-      F.pp_print_string fmt tgt_mut;
-      (* Extract the argument *)
+      F.pp_print_string fmt (extract_mut tgt_mut);
+      F.pp_print_space fmt ();
+      extract_expr ~inside:true arg;
+      if inside then F.pp_print_string fmt ")"
+  | CastPtrExposeProvenance ((_, _), tgt_ty) ->
+      [%cassert] span
+        (backend () = Lean)
+        "Pointer to address casts are only supported in the Lean backend";
+      if inside then F.pp_print_string fmt "(";
+      let cast_str =
+        if Scalars.integer_type_is_signed tgt_ty then "RawPtr.toIScalar"
+        else "RawPtr.toUScalar"
+      in
+      F.pp_print_string fmt cast_str;
+      F.pp_print_space fmt ();
+      F.pp_print_string fmt ("." ^ int_name tgt_ty);
+      F.pp_print_space fmt ();
+      extract_expr ~inside:true arg;
+      if inside then F.pp_print_string fmt ")"
+  | CastPtrWithExposedProvenance (src_ty, (tgt_ty, tgt_mut)) ->
+      [%cassert] span
+        (backend () = Lean)
+        "Address to pointer casts are only supported in the Lean backend";
+      if inside then F.pp_print_string fmt "(";
+      let cast_str =
+        if Scalars.integer_type_is_signed src_ty then "RawPtr.ofIScalar"
+        else "RawPtr.ofUScalar"
+      in
+      F.pp_print_string fmt cast_str;
+      F.pp_print_space fmt ();
+      extract_ty span ctx fmt TypeDeclId.Set.empty ~inside:true tgt_ty;
+      F.pp_print_space fmt ();
+      F.pp_print_string fmt (extract_mut tgt_mut);
       F.pp_print_space fmt ();
       extract_expr ~inside:true arg;
       if inside then F.pp_print_string fmt ")"
 
-let extract_cast_kind (span : Meta.span)
+let extract_cast_kind (span : Meta.span) (ctx : extraction_ctx)
     (extract_expr : inside:bool -> texpr -> unit) (fmt : F.formatter)
     ~(inside : bool) (kind : cast_kind) (arg : texpr) : unit =
   (* HOL4 has a special treatment *)
   match backend () with
   | HOL4 -> extract_cast_kind_hol4 span extract_expr fmt ~inside kind arg
   | FStar | Coq | Lean ->
-      extract_cast_kind_gen span extract_expr fmt ~inside kind arg
+      extract_cast_kind_gen span ctx extract_expr fmt ~inside kind arg
 
 (** Format a unary operation
 
@@ -562,7 +574,7 @@ let extract_cast_kind (span : Meta.span)
     - [inside]
     - unop
     - argument *)
-let extract_unop (span : Meta.span)
+let extract_unop (span : Meta.span) (ctx : extraction_ctx)
     (extract_expr : inside:bool -> texpr -> unit) (fmt : F.formatter)
     ~(inside : bool) (unop : unop) (arg : texpr) : unit =
   match unop with
@@ -573,7 +585,7 @@ let extract_unop (span : Meta.span)
       F.pp_print_space fmt ();
       extract_expr ~inside:true arg;
       if inside then F.pp_print_string fmt ")"
-  | Cast kind -> extract_cast_kind span extract_expr fmt ~inside kind arg
+  | Cast kind -> extract_cast_kind span ctx extract_expr fmt ~inside kind arg
 
 (** Format a binary operation
 
@@ -912,7 +924,7 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
        * Note that the way we generate the translation, we shouldn't get the
        * case where we have no argument (all functions are fully instantiated,
        * and no AST transformation introduces partial calls). *)
-      extract_unop span
+      extract_unop span ctx
         (extract_texpr span ctx fmt ~inside_do)
         fmt ~inside unop arg
   | Binop binop, [ arg0; arg1 ] ->
@@ -971,6 +983,11 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
              true
          ]}
       *)
+      let is_dyn_method =
+        match (fun_id, args) with
+        | FromLlbc (TraitMethod ({ trait_id = Dyn; _ }, _), _), _ :: _ -> true
+        | _ -> false
+      in
       (match fun_id with
       | FromLlbc (TraitMethod (trait_ref, method_name), lp_id) ->
           let trait_decl_id = trait_ref.trait_decl_ref.trait_decl_id in
@@ -979,8 +996,12 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
           in
 
           [%sanity_check] trait_decl.item_meta.span (lp_id = None);
-          extract_trait_ref trait_decl.item_meta.span ctx fmt
-            TypeDeclId.Set.empty ~inside:true trait_ref;
+          (if is_dyn_method then (
+             extract_texpr span ctx fmt ~inside:true ~inside_do (List.hd args);
+             F.pp_print_string fmt ".inst")
+           else
+             extract_trait_ref trait_decl.item_meta.span ctx fmt
+               TypeDeclId.Set.empty ~inside:true trait_ref);
           let fun_name =
             ctx_get_trait_method span trait_ref.trait_decl_ref.trait_decl_id
               method_name ctx
@@ -1084,11 +1105,21 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
             "/- ERROR: ill-formed builtin: invalid number of filtering \
              arguments -/");
       (* Print the arguments *)
-      List.iter
-        (fun ve ->
-          F.pp_print_space fmt ();
-          extract_texpr span ctx fmt ~inside:true ~inside_do ve)
-        args;
+      (if is_dyn_method then (
+         F.pp_print_space fmt ();
+         extract_texpr span ctx fmt ~inside:true ~inside_do (List.hd args);
+         F.pp_print_string fmt ".value";
+         List.iter
+           (fun ve ->
+             F.pp_print_space fmt ();
+             extract_texpr span ctx fmt ~inside:true ~inside_do ve)
+           (List.tl args))
+       else
+         List.iter
+           (fun ve ->
+             F.pp_print_space fmt ();
+             extract_texpr span ctx fmt ~inside:true ~inside_do ve)
+           args);
       (* Close the box for the function call *)
       (*F.pp_close_box fmt ();*)
       (* Return *)

@@ -716,7 +716,9 @@ and eval_statement_raw (config : config) (st : statement) : stl_cm_fun =
       else (
         [%ltrace "The rvalue is not a global access"];
         (* Evaluate the rvalue *)
-        let res, ctx, cc = eval_rvalue_not_global config st.span rvalue ctx in
+        let res, ctx, cc =
+          eval_rvalue_not_global ~dest_ty:p.ty config st.span rvalue ctx
+        in
         (* Assign *)
         [%ltrace
           "about to assign to place: " ^ place_to_string ctx p

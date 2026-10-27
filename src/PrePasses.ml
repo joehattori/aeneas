@@ -1701,6 +1701,159 @@ let remove_vtables (crate : crate) : crate =
       crate.fun_decls
   in
 
+  let rec get_dyn_ty (ty : ty) : (ty * dyn_predicate) option =
+    match ty with
+    | TDynTrait pred -> Some (ty, pred)
+    | TRef (_, ty', _) | TRawPtr (ty', _) -> get_dyn_ty ty'
+    | TAdt { builtin = Some TBox; generics = { types = [ ty' ]; _ }; _ } ->
+        get_dyn_ty ty'
+    | _ -> None
+  in
+  let operand_ty (op : operand) : ty =
+    match op with
+    | Copy p | Move p -> p.ty
+    | Constant c -> c.ty
+  in
+  let replace_vtable_calls (f : fun_decl) : fun_decl =
+    match f.body with
+    | StructuredBody body ->
+        let visitor =
+          object
+            inherit [_] map_statement as super
+
+            method! visit_Call env call on_unwind =
+              match (call.func, call.args) with
+              | ( FnOpDynamic
+                    ((Copy
+                        {
+                          kind =
+                            PlaceProjection
+                              ( { ty = TAdt { id = vtable_type_id; _ }; _ },
+                                Field (None, field_id) );
+                          _;
+                        }
+                     | Move
+                         {
+                           kind =
+                             PlaceProjection
+                               ( { ty = TAdt { id = vtable_type_id; _ }; _ },
+                                 Field (None, field_id) );
+                           _;
+                         }),
+                      _ ),
+                  arg0 :: _ ) -> (
+                  match
+                    ( TypeDeclId.Map.find_opt vtable_type_id crate.type_decls,
+                      get_dyn_ty (operand_ty arg0) )
+                  with
+                  | ( Some { src = VTableType _; kind = Struct fields; _ },
+                      Some
+                        ( dyn_ty,
+                          {
+                            binder =
+                              {
+                                binder_params =
+                                  { trait_clauses = clause :: _; _ };
+                                _;
+                              };
+                          } ) ) -> (
+                      let field = FieldId.nth fields field_id in
+                      let fname = field.field_name in
+                      if String.starts_with ~prefix:"method_" fname then (
+                        let method_name =
+                          String.sub fname 7 (String.length fname - 7)
+                        in
+                        let clause_decl_ref = clause.trait.binder_value in
+                        let trait_decl_id = clause_decl_ref.id in
+                        match
+                          TraitDeclId.Map.find_opt trait_decl_id
+                            crate.trait_decls
+                        with
+                        | Some trait_decl -> (
+                            let method_id_opt =
+                              List.find_map
+                                (fun (method_id, _) ->
+                                  if
+                                    Charon.GAstUtils.get_method_name crate
+                                      trait_decl_id method_id
+                                    = method_name
+                                  then Some method_id
+                                  else None)
+                                (TraitMethodId.Map.bindings
+                                   trait_decl.methods)
+                            in
+                            match method_id_opt with
+                            | Some method_id -> (
+                                match
+                                  Substitute.lookup_flat_method_sig crate
+                                    trait_decl_id method_id
+                                with
+                                | Some method_sig ->
+                                    let trait_generics =
+                                      let g =
+                                        Substitute.generic_args_erase_regions
+                                          clause_decl_ref.generics
+                                      in
+                                      let types =
+                                        match g.types with
+                                        | _ :: tl ->
+                                            TypesUtils.ty_erase_regions dyn_ty
+                                            :: tl
+                                        | [] ->
+                                            [
+                                              TypesUtils.ty_erase_regions
+                                                dyn_ty;
+                                            ]
+                                      in
+                                      { g with types }
+                                    in
+                                    let num_method_regions =
+                                      List.length
+                                        method_sig.item_binder_params.regions
+                                      - List.length trait_generics.regions
+                                    in
+                                    let method_generics =
+                                      {
+                                        empty_generic_args with
+                                        regions =
+                                          List.init
+                                            (max 0 num_method_regions)
+                                            (fun _ -> RErased);
+                                      }
+                                    in
+                                    let trait_ref =
+                                      {
+                                        kind = Dyn;
+                                        trait_decl_ref =
+                                          {
+                                            id = trait_decl_id;
+                                            generics = trait_generics;
+                                          };
+                                      }
+                                    in
+                                    let func =
+                                      FnOpRegular
+                                        {
+                                          kind =
+                                            TraitMethod (trait_ref, method_id);
+                                          generics = method_generics;
+                                        }
+                                    in
+                                    Call ({ call with func }, on_unwind)
+                                | None -> super#visit_Call env call on_unwind)
+                            | None -> super#visit_Call env call on_unwind)
+                        | None -> super#visit_Call env call on_unwind)
+                      else super#visit_Call env call on_unwind)
+                  | _ -> super#visit_Call env call on_unwind)
+              | _ -> super#visit_Call env call on_unwind
+          end
+        in
+        let body = { body with body = visitor#visit_block () body.body } in
+        { f with body = StructuredBody body }
+    | _ -> f
+  in
+  let fun_decls = FunDeclId.Map.map replace_vtable_calls fun_decls in
+
   let trait_decls =
     TraitDeclId.Map.map
       (fun (d : trait_decl) ->

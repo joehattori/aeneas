@@ -589,32 +589,77 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
               let tgt_ty = translate_literal_type tgt_ty in
               (CastLit (src_ty, tgt_ty), not (Config.backend () = Lean))
           | CastRawPtr tgt_ty ->
-              (* We only support casts between pointers to literal types for now *)
-              let get_ty (ty : T.ty) =
+              let get_ptr_ty (ty : T.ty) =
                 match ty with
-                | TRawPtr (TScalar scalar_ty, rkind) ->
+                | TRawPtr (pointee_ty, rkind) ->
                     let mut =
                       match rkind with
                       | RMut -> Mut
                       | RShared -> Const
                     in
-                    (scalar_ty, mut)
+                    (ctx_translate_fwd_ty ctx pointee_ty, mut)
                 | _ ->
                     let env = bs_ctx_to_fmt_env ctx in
                     [%craise] ctx.span
-                      ("Raw ptr casts are only supported between pointers to \
-                        literal types; found: "
+                      ("Expected raw pointer type in raw pointer cast; found: "
                       ^ Charon.Print.cast_kind_to_string env kind)
               in
-              let src_ty, src_mut = get_ty arg_ty in
-              let tgt_ty, tgt_mut = get_ty tgt_ty in
-              let src_ty = translate_literal_type src_ty in
-              let tgt_ty = translate_literal_type tgt_ty in
-              (CastRawPtr ((src_ty, src_mut), (tgt_ty, tgt_mut)), true)
+              let src_ty, src_mut = get_ptr_ty arg_ty in
+              let tgt_ty, tgt_mut = get_ptr_ty tgt_ty in
+              ( CastRawPtr ((src_ty, src_mut), (tgt_ty, tgt_mut)),
+                not (Config.backend () = Lean) )
           | CastPtrExposeProvenance ->
-              [%craise] ctx.span "Unsupported: pointer to address casts"
-          | CastPtrWithExposedProvenance _ ->
-              [%craise] ctx.span "Unsupported: address to pointer casts"
+              let src_ty, src_mut =
+                match arg_ty with
+                | TRawPtr (pointee_ty, rkind) ->
+                    let mut =
+                      match rkind with
+                      | RMut -> Mut
+                      | RShared -> Const
+                    in
+                    (ctx_translate_fwd_ty ctx pointee_ty, mut)
+                | _ ->
+                    let env = bs_ctx_to_fmt_env ctx in
+                    [%craise] ctx.span
+                      ("Expected raw pointer source in pointer-to-address \
+                        cast; found: "
+                      ^ Charon.Print.cast_kind_to_string env kind)
+              in
+              (* Charon does not record the integer target type of this cast:
+                 it is the type of the destination. *)
+              let tgt_ty =
+                match call.dest.sv_ty with
+                | TScalar tgt_ty ->
+                    literal_as_integer (translate_literal_type tgt_ty)
+                | _ -> [%internal_error] ctx.span
+              in
+              ( CastPtrExposeProvenance ((src_ty, src_mut), tgt_ty),
+                not (Config.backend () = Lean) )
+          | CastPtrWithExposedProvenance tgt_ty ->
+              let src_ty =
+                match arg_ty with
+                | TScalar src_ty ->
+                    literal_as_integer (translate_literal_type src_ty)
+                | _ -> [%internal_error] ctx.span
+              in
+              let tgt_ty, tgt_mut =
+                match tgt_ty with
+                | TRawPtr (pointee_ty, rkind) ->
+                    let mut =
+                      match rkind with
+                      | RMut -> Mut
+                      | RShared -> Const
+                    in
+                    (ctx_translate_fwd_ty ctx pointee_ty, mut)
+                | _ ->
+                    let env = bs_ctx_to_fmt_env ctx in
+                    [%craise] ctx.span
+                      ("Expected raw pointer target in address-to-pointer \
+                        cast; found: "
+                      ^ Charon.Print.cast_kind_to_string env kind)
+              in
+              ( CastPtrWithExposedProvenance (src_ty, (tgt_ty, tgt_mut)),
+                not (Config.backend () = Lean) )
           | CastFnDefToFnPtr | CastFnPtrToUnsafe ->
               [%craise] ctx.span "TODO: function casts"
           | CastSubtype _ -> [%craise] ctx.span "Unsupported: subtype casts"
