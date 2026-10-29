@@ -7,6 +7,7 @@ if [[ "$1" == "--force" ]]; then
 fi
 
 rebuild() {
+    apply_patches
     if which nix 2> /dev/null 1>&2; then
         nix develop --command bash -c "make test"
     elif which rustup 2> /dev/null 1>&2; then
@@ -18,6 +19,19 @@ rebuild() {
 }
 
 PINNED_COMMIT="$(tail -1 charon-pin)"
+PATCH_DIR="$(pwd)/charon-patches"
+
+# Apply the local Charon fixes in `charon-patches` (also applied by the Nix
+# build), skipping those already applied. Run from inside `./charon`.
+apply_patches() {
+    for patch in "$PATCH_DIR"/*.patch; do
+        [ -e "$patch" ] || continue
+        if git apply --reverse --check "$patch" 2> /dev/null; then
+            continue
+        fi
+        git apply "$patch" || exit 1
+    done
+}
 if [ ! -e ./charon ]; then
     if [[ "$FORCE" == "1" ]]; then
         git clone https://github.com/AeneasVerif/charon --recurse-submodules
