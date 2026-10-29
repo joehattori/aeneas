@@ -78,7 +78,36 @@
         # nixpkgs marks ocamlformat broken for OCaml 5.4+, so build it with 5.3 instead
         ocamlformat = pkgs.ocaml-ng.ocamlPackages_5_3.ocamlformat_0_27_0;
         coqPackages = pkgs.coqPackages_8_18;
-        charon = inputs.charon.packages.${system}.charon;
+        charonPkgs = inputs.charon.packages.${system};
+        # Local Charon fixes, applied on top of the pinned Charon commit. The
+        # patches are relative to the Charon repository root; the Nix build
+        # source is its `charon/` crate directory.
+        charonPatches = [
+          ./charon-patches/0001-recover-closure-signature-outlives.patch
+        ];
+        charon-unwrapped = charonPkgs.charon-unwrapped.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ charonPatches;
+          patchFlags = [ "-p2" ];
+        });
+        # Same wrapper as Charon's `charon` package, around the patched build.
+        charon = pkgs.runCommand "charon"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ]
+              ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.cctools ];
+            passthru = charon-unwrapped.passthru;
+          }
+          (''
+            cp -r ${charon-unwrapped} $out
+            chmod -R u+w $out
+            wrapProgram $out/bin/charon \
+              --set CHARON_TOOLCHAIN_IS_IN_PATH 1 \
+              --set CHARON_MIRI_SYSROOTS "${charonPkgs.charon-full-mir-sysroots}" \
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ charonPkgs.rustToolchain ]}" \
+              --prefix PATH : "${pkgs.lib.makeBinPath [ charonPkgs.rustToolchain ]}"
+          ''
+          + (pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+            install_name_tool -add_rpath "${charonPkgs.rustToolchain}/lib" "$out/bin/charon-driver"
+          ''));
         charon-release = inputs.charon.packages.${system}.charon-release;
         charon-ml = inputs.charon.packages.${system}.charon-ml.override { inherit ocamlPackages; };
 

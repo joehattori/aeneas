@@ -1,0 +1,361 @@
+From ef40ff84150883becd1b9cbb55fc4e9f50deb6d6 Mon Sep 17 00:00:00 2001
+From: Joe Hattori <hattorij@google.com>
+Date: Fri, 30 Oct 2026 02:44:39 +0000
+Subject: [PATCH] Recover outlives relations between closure signature regions
+
+hax::closure_sig replaces the regions that rustc erased from a closure signature with fresh, unrelated bound regions. A closure such as |a: &A| a.pools() then gets the signature fn(&'0 A) -> &'1 [T] without '0: '1, which its own body does not satisfy, and Aeneas fails with "Can't end abstraction ... non-endable".
+
+Override the mir_borrowck query to read the region inference context of every closure nested in the checked item (rustc_borrowck::consumers), and record which signature regions the body requires to outlive which. Borrowck runs before later MIR passes steal the promoted MIR. When translating the generics of a closure item, add the recorded relations as region outlives predicates. Nothing is recorded with --skip-borrowck or for built MIR.
+---
+ .../src/bin/charon-driver/closure_outlives.rs | 187 ++++++++++++++++++
+ charon/src/bin/charon-driver/driver.rs        |   2 +
+ charon/src/bin/charon-driver/main.rs          |   2 +
+ .../translate/translate_generics.rs           |  53 +++++
+ charon/tests/ui/closures.out                  |  12 +-
+ 5 files changed, 250 insertions(+), 6 deletions(-)
+ create mode 100644 charon/src/bin/charon-driver/closure_outlives.rs
+
+diff --git a/charon/src/bin/charon-driver/closure_outlives.rs b/charon/src/bin/charon-driver/closure_outlives.rs
+new file mode 100644
+index 000000000..5bbbf6664
+--- /dev/null
++++ b/charon/src/bin/charon-driver/closure_outlives.rs
+@@ -0,0 +1,187 @@
++//! Recover outlives relations between the regions of closure signatures.
++//!
++//! Rustc erases the regions of a closure signature after type-checking. Charon turns each erased
++//! region into a fresh, unrelated region parameter of the closure (see `unerase_lifetimes`). The
++//! closure body may however require relations between them, e.g. `|x: &T| -> &U { &x.field }`
++//! needs the region of the argument to outlive the region of the result. Rustc proves these
++//! requirements in the borrow checker of the enclosing item, which is not visible in the erased
++//! signature. Without them, the translated closure signature is not satisfied by its own body.
++//!
++//! We recover these relations from the borrow-checker region inference context. This context is
++//! only available while the borrow checker runs, i.e. before the MIR bodies are stolen by later
++//! MIR passes, so we override the `mir_borrowck` query to record the relations for every closure
++//! nested in the item being checked.
++use crate::hax;
++use rustc_borrowck::consumers::{ConsumerOptions, get_bodies_with_borrowck_facts};
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::LocalDefId;
++use rustc_middle::mir::Body;
++use rustc_middle::ty::{self, RegionVid, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
++use rustc_middle::util::Providers;
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{LazyLock, Mutex, MutexGuard};
++
++/// Pairs `(a, b)` of positions in [`sig_regions`] of the closure signature such that the body
++/// requires the region at position `a` to outlive the region at position `b`.
++pub type SigOutlives = Vec<(usize, usize)>;
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++static CLOSURE_SIG_OUTLIVES: LazyLock<Mutex<HashMap<LocalDefId, SigOutlives>>> =
++    LazyLock::new(Default::default);
++
++/// Install the `mir_borrowck` override that records closure signature outlives relations.
++pub fn override_mir_borrowck(providers: &mut Providers) {
++    ENABLED.store(true, Ordering::SeqCst);
++    providers.queries.mir_borrowck = |tcx, def_id| {
++        let result = (rustc_interface::DEFAULT_QUERY_PROVIDERS.queries.mir_borrowck)(tcx, def_id);
++        if result.is_ok() {
++            record_closure_sig_outlives(tcx, def_id);
++        }
++        result
++    };
++}
++
++/// The outlives relations between the regions of `hax::closure_sig` for this closure, if they
++/// could be computed. This runs the borrow checker on the enclosing item if it hasn't run yet.
++pub fn closure_sig_outlives(tcx: TyCtxt<'_>, closure: LocalDefId) -> Option<SigOutlives> {
++    if !ENABLED.load(Ordering::SeqCst) {
++        return None;
++    }
++    if let Some(rels) = lock_map().get(&closure) {
++        return Some(rels.clone());
++    }
++    let root = tcx.typeck_root_def_id_local(closure);
++    // Borrow-checking needs the promoted MIR of the root. Don't trigger it if it was already
++    // consumed: in that case borrowck has already run and recorded what it could.
++    if !tcx.mir_promoted(root).0.is_stolen() {
++        let _ = tcx.mir_borrowck(root);
++    }
++    lock_map().get(&closure).cloned()
++}
++
++fn record_closure_sig_outlives(tcx: TyCtxt<'_>, root: LocalDefId) {
++    let has_closures = tcx
++        .nested_bodies_within(root)
++        .iter()
++        .any(|def_id| is_plain_closure(tcx, def_id));
++    if !has_closures {
++        return;
++    }
++    let bodies = get_bodies_with_borrowck_facts(tcx, root, ConsumerOptions::RegionInferenceContext);
++    let mut found = Vec::new();
++    for (def_id, facts) in bodies.iter() {
++        if !is_plain_closure(tcx, *def_id) {
++            continue;
++        }
++        if let Some(rels) = sig_outlives_for_body(tcx, *def_id, &facts.body, |sup, sub| {
++            facts.region_inference_context.eval_outlives(sup, sub)
++        }) {
++            found.push((*def_id, rels));
++        }
++    }
++    lock_map().extend(found);
++}
++
++fn lock_map() -> MutexGuard<'static, HashMap<LocalDefId, SigOutlives>> {
++    CLOSURE_SIG_OUTLIVES
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner())
++}
++
++/// Collect the regions of a type in visiting order, each with the number of binders inside the
++/// type that enclose it.
++fn collect_regions<'tcx>(ty: ty::Ty<'tcx>) -> Vec<(ty::Region<'tcx>, ty::DebruijnIndex)> {
++    struct Collector<'tcx> {
++        depth: ty::DebruijnIndex,
++        regions: Vec<(ty::Region<'tcx>, ty::DebruijnIndex)>,
++    }
++    impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for Collector<'tcx> {
++        fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, t: &ty::Binder<'tcx, T>) {
++            self.depth.shift_in(1);
++            t.super_visit_with(self);
++            self.depth.shift_out(1);
++        }
++        fn visit_region(&mut self, r: ty::Region<'tcx>) {
++            self.regions.push((r, self.depth));
++        }
++    }
++    let mut collector = Collector {
++        depth: ty::INNERMOST,
++        regions: Vec::new(),
++    };
++    ty.visit_with(&mut collector);
++    collector.regions
++}
++
++fn is_plain_closure(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
++    tcx.def_kind(def_id) == DefKind::Closure
++        && matches!(
++            tcx.type_of(def_id).instantiate_identity().skip_normalization().kind(),
++            ty::Closure(..)
++        )
++}
++
++/// The regions of the inputs and output of a closure signature, in visiting order. Regions under a
++/// binder inside the types (e.g. of a `fn` pointer argument) are `None`; the others are erased,
++/// placeholder, or bound by the signature binder itself.
++pub fn sig_regions<'tcx>(sig: ty::FnSig<'tcx>) -> Vec<Option<ty::Region<'tcx>>> {
++    sig.inputs()
++        .iter()
++        .copied()
++        .chain([sig.output()])
++        .flat_map(collect_regions)
++        .map(|(r, depth)| (depth == ty::INNERMOST).then_some(r))
++        .collect()
++}
++
++/// Map each position of [`sig_regions`] of the closure signature to a region variable of the
++/// borrow-checked body, by matching the signature against the types of the body's arguments and
++/// return place, then compare these region variables.
++fn sig_outlives_for_body<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    def_id: LocalDefId,
++    body: &Body<'tcx>,
++    eval_outlives: impl Fn(RegionVid, RegionVid) -> bool,
++) -> Option<SigOutlives> {
++    let ty::Closure(_, args) = *tcx.type_of(def_id).instantiate_identity().skip_normalization().kind()
++    else {
++        return None;
++    };
++    let sig = hax::closure_sig(tcx, args.as_closure()).skip_binder();
++    // The body takes the closure state, followed by the untupled arguments.
++    if body.arg_count != sig.inputs().len() + 1 {
++        return None;
++    }
++    let body_regions: Vec<_> = (2..=body.arg_count)
++        .map(|i| body.local_decls[rustc_middle::mir::Local::from_usize(i)].ty)
++        .chain([body.local_decls[rustc_middle::mir::RETURN_PLACE].ty])
++        .flat_map(collect_regions)
++        .collect();
++    let sig_regions = sig_regions(sig);
++    if sig_regions.len() != body_regions.len() {
++        return None;
++    }
++    let vars: Vec<Option<RegionVid>> = sig_regions
++        .iter()
++        .zip(body_regions)
++        .map(|(sig_r, (body_r, _))| match (sig_r, body_r.kind()) {
++            (Some(_), ty::ReVar(vid)) => Some(vid),
++            _ => None,
++        })
++        .collect();
++
++    let mut rels = Vec::new();
++    for (a, va) in vars.iter().enumerate() {
++        for (b, vb) in vars.iter().enumerate() {
++            if a != b
++                && let (Some(va), Some(vb)) = (va, vb)
++                && va != vb
++                && eval_outlives(*va, *vb)
++            {
++                rels.push((a, b));
++            }
++        }
++    }
++    Some(rels)
++}
+diff --git a/charon/src/bin/charon-driver/driver.rs b/charon/src/bin/charon-driver/driver.rs
+index acf20d73c..e29c74f9b 100644
+--- a/charon/src/bin/charon-driver/driver.rs
++++ b/charon/src/bin/charon-driver/driver.rs
+@@ -65,6 +65,8 @@ fn skip_borrowck_if_set(providers: &mut Providers) {
+             // Empty result, which is what is used for custom_mir bodies.
+             Ok(tcx.arena.alloc(Default::default()))
+         }
++    } else {
++        crate::closure_outlives::override_mir_borrowck(providers);
+     }
+ }
+ 
+diff --git a/charon/src/bin/charon-driver/main.rs b/charon/src/bin/charon-driver/main.rs
+index 52654d9d0..c1103e1bf 100644
+--- a/charon/src/bin/charon-driver/main.rs
++++ b/charon/src/bin/charon-driver/main.rs
+@@ -19,6 +19,7 @@
+ extern crate rustc_abi;
+ extern crate rustc_ast;
+ extern crate rustc_ast_pretty;
++extern crate rustc_borrowck;
+ extern crate rustc_data_structures;
+ extern crate rustc_driver;
+ extern crate rustc_hir;
+@@ -34,6 +35,7 @@ extern crate rustc_trait_selection;
+ #[macro_use]
+ extern crate charon_lib;
+ 
++mod closure_outlives;
+ mod driver;
+ #[macro_use]
+ pub mod hax;
+diff --git a/charon/src/bin/charon-driver/translate/translate_generics.rs b/charon/src/bin/charon-driver/translate/translate_generics.rs
+index 0d5bb9ad6..78f218fe9 100644
+--- a/charon/src/bin/charon-driver/translate/translate_generics.rs
++++ b/charon/src/bin/charon-driver/translate/translate_generics.rs
+@@ -9,6 +9,7 @@ use rustc_span::def_id::DefId as RDefId;
+ 
+ use super::translate_ctx::{ItemTransCtx, TransImplSource, TransItemSourceKind};
+ use charon_lib::ast::*;
++use charon_lib::options::MirLevel;
+ use charon_lib::utils::CycleDetector;
+ 
+ /// A level of binding for type-level variables. Each item has a top-level binding level
+@@ -617,6 +618,7 @@ impl<'tcx, 'ctx> ItemTransCtx<'tcx, 'ctx> {
+             {
+                 self.the_only_binder_mut()
+                     .push_params_from_binder(c.sig().rebind(()))?;
++                self.push_closure_sig_outlives(span, def);
+             }
+         }
+ 
+@@ -650,6 +652,57 @@ impl<'tcx, 'ctx> ItemTransCtx<'tcx, 'ctx> {
+         Ok(())
+     }
+ 
++    /// Add the outlives relations between the closure signature regions that the closure body
++    /// requires. Rustc erases most of these regions, and `push_param_env_without_parents` turns
++    /// them into unrelated region parameters of the closure.
++    fn push_closure_sig_outlives(&mut self, span: Span, def: &hax::FullDef<'tcx>) {
++        if self.t_ctx.options.mir_level < MirLevel::Promoted {
++            // Borrow-checking would steal the built MIR that we translate.
++            return;
++        }
++        let Some(closure) = def.def_id().real_rust_def_id().as_local() else {
++            return;
++        };
++        let Some(rels) = crate::closure_outlives::closure_sig_outlives(self.t_ctx.tcx, closure)
++        else {
++            return;
++        };
++        if rels.is_empty() {
++            return;
++        }
++        // The same signature as `hax::Closure::sig`, whose erased regions are placeholders.
++        let args = def.this().rustc_args(self.hax_state_with_id());
++        let sig = hax::closure_sig(self.t_ctx.tcx, args.as_closure());
++        let regions = crate::closure_outlives::sig_regions(sig.skip_binder());
++        let translate = |this: &mut Self, i: usize| -> Option<RegionId> {
++            use crate::hax::SInto;
++            let region: hax::Region =
++                regions.get(i).copied().flatten()?.sinto(this.hax_state_with_id());
++            match this.translate_region(span, &region).ok()? {
++                Region::Var(DeBruijnVar::Bound(dbid, rid)) if dbid == DeBruijnId::zero() => {
++                    Some(rid)
++                }
++                _ => None,
++            }
++        };
++        for (a, b) in rels {
++            let (Some(ra), Some(rb)) = (translate(self, a), translate(self, b)) else {
++                continue;
++            };
++            if ra == rb {
++                continue;
++            }
++            let pred = RegionBinder::empty(OutlivesPred(
++                Region::Var(DeBruijnVar::new_at_zero(ra)),
++                Region::Var(DeBruijnVar::new_at_zero(rb)),
++            ));
++            let params = &mut self.the_only_binder_mut().params;
++            if !params.regions_outlive.contains(&pred) {
++                params.regions_outlive.push(pred);
++            }
++        }
++    }
++
+     /// Push a new binding level, run the provided function inside it, then return the bound value.
+     pub(crate) fn inside_binder<F, U>(
+         &mut self,
+diff --git a/charon/tests/ui/closures.out b/charon/tests/ui/closures.out
+index 55356978e..8c88d3399 100644
+--- a/charon/tests/ui/closures.out
++++ b/charon/tests/ui/closures.out
+@@ -1883,8 +1883,8 @@ struct test_crate::test_regions::{closure}<'_0> {}
+ // Full name: test_crate::test_regions::{impl Fn<(&'_1 &'_0 u32,), u32> for test_crate::test_regions::{closure}<'_0>}::call
+ extern "rust-call" fn {impl Fn<(&'_1 &'_0 u32,), u32> for test_crate::test_regions::{closure}<'_0>}::call<'_0, '_1, '_2>(_1: &'_2 test_crate::test_regions::{closure}<'_0>, tupled_args: (&'_1 &'_0 u32,)) -> u32
+ where
+-    RegionOutlives0: '_0: '_2,
+-    RegionOutlives1: '_0: '_1,
++    RegionOutlives0: '_0: '_1,
++    RegionOutlives1: '_0: '_2,
+ {
+     let _0: u32; // return
+     let _1: &'7 test_crate::test_regions::{closure}<'_0>; // arg #1
+@@ -1941,8 +1941,8 @@ struct test_crate::test_regions_casted::{closure}<'_0> {}
+ // Full name: test_crate::test_regions_casted::{impl Fn<(&'_1 &'_0 u32,), u32> for test_crate::test_regions_casted::{closure}<'_0>}::call
+ extern "rust-call" fn {impl Fn<(&'_1 &'_0 u32,), u32> for test_crate::test_regions_casted::{closure}<'_0>}::call<'_0, '_1, '_2>(_1: &'_2 test_crate::test_regions_casted::{closure}<'_0>, tupled_args: (&'_1 &'_0 u32,)) -> u32
+ where
+-    RegionOutlives0: '_0: '_2,
+-    RegionOutlives1: '_0: '_1,
++    RegionOutlives0: '_0: '_1,
++    RegionOutlives1: '_0: '_2,
+ {
+     let _0: u32; // return
+     let _1: &'7 test_crate::test_regions_casted::{closure}<'_0>; // arg #1
+@@ -1962,8 +1962,8 @@ where
+ // Full name: test_crate::test_regions_casted::{impl FnMut<(&'_1 &'_0 u32,), u32> for test_crate::test_regions_casted::{closure}<'_0>}::call_mut
+ extern "rust-call" fn {impl FnMut<(&'_1 &'_0 u32,), u32> for test_crate::test_regions_casted::{closure}<'_0>}::call_mut<'_0, '_1, '_2>(state: &'_2 mut test_crate::test_regions_casted::{closure}<'_0>, args: (&'_1 &'_0 u32,)) -> u32
+ where
+-    RegionOutlives0: '_0: '_2,
+-    RegionOutlives1: '_0: '_1,
++    RegionOutlives0: '_0: '_1,
++    RegionOutlives1: '_0: '_2,
+ {
+     let _0: u32; // return
+     let state: &'_2 mut test_crate::test_regions_casted::{closure}<'_0>; // arg #1
+-- 
+2.56.0.317.g454f8302e1-goog
+
