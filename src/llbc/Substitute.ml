@@ -7,18 +7,25 @@ open Types
 open Values
 open LlbcAst
 
-(** Visitor to erase the static region *)
+(** Visitor to erase the static region, and the region binders of function item
+    types. These binders only quantify regions of the function signature, so
+    [f<'1>] in a body and [for<'a> f<'a>] in a signature must have the same
+    erased type. *)
 let erase_static_visitor =
   object
-    inherit [_] map_ty
+    inherit [_] map_ty as super
     method! visit_RStatic _ = RErased
+
+    method! visit_TFnDef env binder =
+      super#visit_TFnDef env { binder with binder_regions = [] }
   end
 
 (** Erase the regions in a type.
 
     This shadows {!Charon.Substitute.erase_regions}: the difference is that we
     also erase the static region (the types of the values in the environment
-    should have all their regions erased). *)
+    should have all their regions erased) and the region binders of function
+    item types. *)
 let erase_regions (ty : ty) : ty =
   erase_static_visitor#visit_ty () (Charon.Substitute.erase_regions ty)
 

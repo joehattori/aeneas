@@ -2,6 +2,51 @@ open Types
 open Utils
 include Charon.TypesUtils
 
+(** Bind the erased regions in the generics of a function item type, such as the
+    late-bound region ['1] in [f<'1>] in a function body. A function item is
+    zero-sized and carries no borrow, so these regions only matter in the
+    function signature. Binding them turns the type into a region type, as
+    required for symbolic values. *)
+let fn_def_ty_bind_erased_regions (ty : ty) : ty =
+  match ty with
+  | TFnDef binder ->
+      let new_regions = ref [] in
+      let next_index =
+        ref
+          (List.fold_left
+             (fun n (rp : region_param) -> max n (RegionId.to_int rp.index + 1))
+             0 binder.binder_regions)
+      in
+      let visitor =
+        object
+          inherit [_] map_ty
+
+          method! visit_RErased _ =
+            let index = RegionId.of_int !next_index in
+            incr next_index;
+            new_regions :=
+              {
+                index;
+                name = None;
+                variance = VaUnknown;
+                mutability = LtUnknown;
+                late_bound = true;
+              }
+              :: !new_regions;
+            RVar (Bound (0, index))
+        end
+      in
+      let generics =
+        visitor#visit_generic_args () binder.binder_value.generics
+      in
+      TFnDef
+        {
+          binder with
+          binder_regions = binder.binder_regions @ List.rev !new_regions;
+          binder_value = { binder.binder_value with generics };
+        }
+  | _ -> ty
+
 let constant_expr_as_literal (c : constant_expr) : Values.literal =
   match c.kind with
   | CBool v -> VBool v
@@ -184,6 +229,11 @@ let ty_has_regions_in_pred_aux (infos : TypesAnalysis.type_infos option)
         (* Ignore the dyn traits by default *)
         if Config.type_analysis_ignore_dyn then ()
         else super#visit_TDynTrait env tr
+
+      method! visit_TFnDef _ _ =
+        (* A function item is zero-sized and carries no borrow: the regions in
+           its generics belong to the function signature. *)
+        ()
     end
   in
   try
@@ -486,6 +536,22 @@ let raise_if_not_rty_visitor =
       | RStatic | RVar (Free _) -> ()
       | RBody _ -> [%craise_opt_span] None "unsupported: Body region"
 
+    method! visit_TFnDef env binder =
+      (* The generics of a function item may mention the regions bound by its
+         binder, which are the late-bound regions of the function. *)
+      let visitor =
+        object
+          inherit [_] iter_ty
+
+          method! visit_region _ r =
+            match r with
+            | RErased -> raise Found
+            | RStatic | RVar _ -> ()
+            | RBody _ -> [%craise_opt_span] None "unsupported: Body region"
+        end
+      in
+      visitor#visit_generic_args env binder.binder_value.generics
+
     method! visit_TDynTrait env tr =
       (* Ignore dyn traits by default *)
       if Config.type_analysis_ignore_dyn then ()
@@ -536,8 +602,13 @@ let ty_erase_body_regions ty =
 let ty_erase_regions ty =
   let visitor =
     object
-      inherit [_] map_ty
+      inherit [_] map_ty as super
       method! visit_region _ _ = RErased
+
+      (* Like {!Substitute.erase_regions}, also erase the region binders of
+         function item types *)
+      method! visit_TFnDef env binder =
+        super#visit_TFnDef env { binder with binder_regions = [] }
     end
   in
   visitor#visit_ty () ty

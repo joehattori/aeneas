@@ -546,7 +546,10 @@ let eval_operand_no_reorganize (config : config) (span : Meta.span)
           in
           (cv, ctx, cc_comp cc cf)
       | CFnDef ptr ->
-          let sv = mk_fresh_symbolic_tvalue span ctx cv.ty in
+          let sv =
+            mk_fresh_symbolic_tvalue span ctx
+              (TypesUtils.fn_def_ty_bind_erased_regions cv.ty)
+          in
           let cf e =
             SymbolicAst.IntroSymbolic
               (ctx, None, tvalue_as_symbolic span sv, SymbolicAst.VaFnDef ptr, e)
@@ -776,8 +779,7 @@ let cast_unsize_to_modified_fields (span : Meta.span) (ctx : eval_ctx)
     else [%craise] span (mk_msg ())
 
 let eval_unary_op_symbolic ?(dest_ty : ty option) (config : config)
-    (span : Meta.span) (unop : unop)
-    (op : operand) (ctx : eval_ctx) :
+    (span : Meta.span) (unop : unop) (op : operand) (ctx : eval_ctx) :
     (tvalue, eval_error) result
     * eval_ctx
     * (SymbolicAst.expr -> SymbolicAst.expr) =
@@ -1004,8 +1006,7 @@ let eval_unary_op_symbolic ?(dest_ty : ty option) (config : config)
             let _ = cast_unsize_to_modified_fields span ctx ty0 ty1 in
             ty1
         | Cast (CastRawPtr tgt_ty), _
-        | Cast (CastPtrWithExposedProvenance tgt_ty), _ ->
-            tgt_ty
+        | Cast (CastPtrWithExposedProvenance tgt_ty), _ -> tgt_ty
         | _ ->
             [%craise] span
               ("Invalid input for unop: " ^ unop_to_string ctx unop ^ " on "
@@ -1024,8 +1025,7 @@ let eval_unary_op_symbolic ?(dest_ty : ty option) (config : config)
       (res, ctx, cc)
 
 let eval_unary_op ?(dest_ty : ty option) (config : config) (span : Meta.span)
-    (unop : unop)
-    (op : operand) (ctx : eval_ctx) :
+    (unop : unop) (op : operand) (ctx : eval_ctx) :
     (tvalue, eval_error) result
     * eval_ctx
     * (SymbolicAst.expr -> SymbolicAst.expr) =
@@ -1494,8 +1494,7 @@ let eval_discriminant (config : config) (span : Meta.span) (p : place)
   | _ -> [%internal_error] span
 
 let eval_rvalue_not_global ?(dest_ty : ty option) (config : config)
-    (span : Meta.span)
-    (rvalue : rvalue) (ctx : eval_ctx) :
+    (span : Meta.span) (rvalue : rvalue) (ctx : eval_ctx) :
     (tvalue, eval_error) result
     * eval_ctx
     * (SymbolicAst.expr -> SymbolicAst.expr) =
