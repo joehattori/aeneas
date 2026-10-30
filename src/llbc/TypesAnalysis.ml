@@ -1078,5 +1078,13 @@ let check_fun_decl_no_bound_free_implied_bounds
       (fun (c : trait_param) -> c.trait.binder_value.generics.types)
       f.generics.trait_clauses
   in
-  check_no_bound_free_implied_bounds span type_decls
-    ((output :: inputs) @ clause_tys)
+  (* Only check functions whose body we translate. Such a constraint matters
+     when symbolically executing a body, but call sites of an opaque function
+     only use its erased signature. This lets us call external functions such
+     as the slice iterator's [find], whose predicate [P: for<'b> FnMut(&'b &'a
+     T) -> bool] implies ['a: 'b]. *)
+  match f.body with
+  | StructuredBody _ ->
+      check_no_bound_free_implied_bounds span type_decls
+        ((output :: inputs) @ clause_tys)
+  | _ -> ()
