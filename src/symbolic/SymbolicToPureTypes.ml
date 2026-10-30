@@ -539,8 +539,10 @@ and compute_back_ty_num_levels (span : Meta.span option)
           (generics = TypesUtils.empty_generic_args)
           "Unimplemented";
         save_count outer_regions
-    | TFnDef _ | TFnPtr _ ->
-        [%craise_opt_span] span "Arrow types are not supported yet"
+    | TFnDef _ ->
+        (* A function item is a zero-sized value: it carries no borrow. *)
+        save_count outer_regions
+    | TFnPtr _ -> [%craise_opt_span] span "Arrow types are not supported yet"
     | TDynTrait _ -> save_count outer_regions
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
@@ -673,8 +675,10 @@ and translate_back_ty_aux (span : Meta.span option) (decls_ctx : C.decls_ctx)
           (generics = TypesUtils.empty_generic_args)
           "Unimplemented";
         stop outer_regions ty
-    | TFnDef _ | TFnPtr _ ->
-        [%craise_opt_span] span "Arrow types are not supported yet"
+    | TFnDef _ ->
+        (* A function item is a zero-sized value: it carries no borrow. *)
+        stop outer_regions ty
+    | TFnPtr _ -> [%craise_opt_span] span "Arrow types are not supported yet"
     | TDynTrait _ -> stop outer_regions ty
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
