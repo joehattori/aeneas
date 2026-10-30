@@ -546,7 +546,10 @@ let eval_operand_no_reorganize (config : config) (span : Meta.span)
           in
           (cv, ctx, cc_comp cc cf)
       | CFnDef ptr ->
-          let sv = mk_fresh_symbolic_tvalue span ctx cv.ty in
+          let sv =
+            mk_fresh_symbolic_tvalue span ctx
+              (TypesUtils.fn_def_ty_bind_erased_regions cv.ty)
+          in
           let cf e =
             SymbolicAst.IntroSymbolic
               (ctx, None, tvalue_as_symbolic span sv, SymbolicAst.VaFnDef ptr, e)
@@ -996,8 +999,7 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
             let _ = cast_unsize_to_modified_fields span ctx ty0 ty1 in
             ty1
         | Cast (CastRawPtr tgt_ty), _
-        | Cast (CastPtrWithExposedProvenance tgt_ty), _ ->
-            tgt_ty
+        | Cast (CastPtrWithExposedProvenance tgt_ty), _ -> tgt_ty
         | _ ->
             [%craise] span
               ("Invalid input for unop: " ^ unop_to_string ctx unop ^ " on "

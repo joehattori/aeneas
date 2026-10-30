@@ -397,8 +397,11 @@ let rec translate_fwd_ty (span : Meta.span option) (decls_ctx : C.decls_ctx)
         "Unimplemented";
       let trait_ref = translate_fwd_trait_ref span decls_ctx trait_ref in
       TTraitType (trait_ref, type_name)
-  | TFnDef { binder_regions; binder_value = { kind; generics }; _ } -> (
-      [%cassert_opt_span] span (binder_regions = []) "Unimplemented";
+  | TFnDef { binder_value = { kind; generics }; _ } -> (
+      (* The binder regions are the late-bound regions of the function, such
+         as the region of [&self] in a method used as a closure. They only
+         appear in the function signature, which we translate with regions
+         erased. *)
       let generics = translate_fwd_generic_args span decls_ctx generics in
       match kind with
       | T.Fun fid ->
