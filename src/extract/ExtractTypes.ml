@@ -509,6 +509,29 @@ let rec extract_ty (span : Meta.span) (ctx : extraction_ctx) (fmt : F.formatter)
             ^ trait_clause_to_string ctx clause];
           if inside then F.pp_print_string fmt "(";
           F.pp_print_string fmt dyn_ty;
+          (* The hidden type of a trait object lives in [Type u] for some [u].
+             When the trait clause mentions no type variable besides [Self],
+             nothing else determines [u]: a function taking such a trait object
+             would be universe-polymorphic and calling it with, e.g., [none]
+             would leave a universe metavariable. Rust types are extracted to
+             [Type], so we fix the hidden type to [Type] in that case. *)
+          let mentions_outer_type_vars =
+            let visitor =
+              object
+                inherit [_] iter_ty
+                method! visit_TVar _ var =
+                  match var with
+                  | Bound _ -> ()
+                  | Free _ -> raise Exit
+              end
+            in
+            try
+              List.iter (visitor#visit_ty ()) clause.generics.types;
+              false
+            with Exit -> true
+          in
+          if (not mentions_outer_type_vars) && backend () = Lean then
+            F.pp_print_string fmt ".{0, _}";
           F.pp_print_space fmt ();
           (* We need to generate something of the shape: [fun dyn => Trait dyn ...] *)
           (* TODO: properly handle bound type variables *)
