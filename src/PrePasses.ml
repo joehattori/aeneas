@@ -495,6 +495,11 @@ let update_loops (crate : crate) (f : fun_decl) : fun_decl =
     object (self)
       inherit [_] map_statement as super
 
+      (* The statements executed after the current block, up to the end of the
+         function body: they continue the control-flow once the current block
+         ends. *)
+      val mutable continuation : statement list = []
+
       (* [after]: the list of statements coming *after* this one in this block.
 
          We return:
@@ -505,6 +510,10 @@ let update_loops (crate : crate) (f : fun_decl) : fun_decl =
       *)
       method update_statement (depth : int) (st : statement)
           (after : statement list) : statement list * statement list =
+        (* The statements executed after [st]: [after], then the statements
+           after the enclosing blocks (we read the field before visiting the
+           loop below, which updates it) *)
+        let st_continuation = continuation in
         match st.kind with
         | Loop loop -> (
             (* Recursively update the loop.
@@ -567,6 +576,13 @@ let update_loops (crate : crate) (f : fun_decl) : fun_decl =
                 (* Transformations 2 and 3 *)
                 (* Check if the statements after the loop end with a return or a panic.
                    We output the statements with which to replace breaks.
+
+                   If the current block ends without returning or panicking, the
+                   control-flow continues after the enclosing blocks, for instance
+                   when the loop is in a branch of a [match]. We then copy the
+                   statements which follow these blocks up to the return or the
+                   panic. The loop is then followed by a return, so these copies
+                   replace the fall-through from this branch.
                 *)
                 let rec decompose_after (after : statement list) :
                     statement list =
@@ -580,7 +596,7 @@ let update_loops (crate : crate) (f : fun_decl) : fun_decl =
                       | Panic _ | UnwindTerminate | UndefinedBehavior -> [ st ]
                       | _ -> st :: decompose_after after)
                 in
-                let after = decompose_after after in
+                let after = decompose_after st_continuation in
                 let replace (st : statement) : statement list =
                   match st.kind with
                   | Return ->
@@ -624,14 +640,21 @@ let update_loops (crate : crate) (f : fun_decl) : fun_decl =
         | _ -> ([ self#visit_statement depth st ], after)
 
       method! visit_block depth (block : block) : block =
+        let outer = continuation in
         let rec update (stl : statement list) : statement list =
           match stl with
           | [] -> []
           | st :: stl ->
+              (* While visiting [st], the control-flow continues with [stl] then
+                 [outer] *)
+              continuation <- stl @ outer;
               let stl0, stl1 = self#update_statement depth st stl in
+              continuation <- outer;
               stl0 @ update stl1
         in
-        { block with statements = update block.statements }
+        let block = { block with statements = update block.statements } in
+        continuation <- outer;
+        block
 
       method! visit_Break depth i =
         [%cassert] span (i = 0) "Breaks to outer loops are not supported yet";
