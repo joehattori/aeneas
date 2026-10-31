@@ -33,16 +33,17 @@ def Region.end (self : Region) : Result Std.U64 := do
 
 /-- [fn_item_late_bound::{fn_item_late_bound::Region}::{impl core::ops::function::FnOnce<(&'_0 fn_item_late_bound::Region,), u64> for for<'_0_1> fn_item_late_bound::{fn_item_late_bound::Region}::end<'_0_1>}::call_once]:
     Source: 'tests/src/fn_item_late_bound.rs', lines 11:4-13:5 -/
-def P.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64.call_once
+def Region.end.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64.call_once
   (state : Region → Result Std.U64) (args : Region) : Result Std.U64 := do
   Region.end args
 
 /-- Trait implementation: [fn_item_late_bound::{fn_item_late_bound::Region}::{impl core::ops::function::FnOnce<(&'_0 fn_item_late_bound::Region,), u64> for for<'_0_1> fn_item_late_bound::{fn_item_late_bound::Region}::end<'_0_1>}]
     Source: 'tests/src/fn_item_late_bound.rs', lines 11:4-13:5 -/
 @[reducible]
-def P.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64 :
+def Region.end.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64 :
   core.ops.function.FnOnce (Region → Result Std.U64) Region Std.U64 := {
-  call_once := P.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64.call_once
+  call_once :=
+    Region.end.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64.call_once
 }
 
 /-- [fn_item_late_bound::apply]:
@@ -57,6 +58,7 @@ def apply
 /-- [fn_item_late_bound::region_end]:
     Source: 'tests/src/fn_item_late_bound.rs', lines 20:0-22:1 -/
 def region_end (r : Region) : Result Std.U64 := do
-  apply P.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64 r (Region.end)
+  apply Region.end.Insts.CoreOpsFunctionFnOnceTupleShared0RegionU64 r
+    (Region.end)
 
 end fn_item_late_bound
