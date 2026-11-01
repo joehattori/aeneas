@@ -42,6 +42,7 @@ package «tests» {}
 @[default_target] lean_lib FnItemConstructors
 @[default_target] lean_lib FnItemLateBound
 @[default_target] lean_lib FnPtrGeneric
+@[default_target] lean_lib FnPtrTypes
 @[default_target] lean_lib ExternalEntrypoint
 @[default_target] lean_lib FromTo
 @[default_target] lean_lib GenericUnitOutput

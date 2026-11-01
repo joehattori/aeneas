@@ -150,6 +150,13 @@ let synthesize_regular_function_call (span : Meta.span) (fun_id : fn_ptr_kind)
     (Some (sg, inst_sg))
     abstractions generics args args_places dest dest_place e
 
+let synthesize_fn_ptr_call (span : Meta.span) (call_id : FunCallId.id)
+    (ctx : Contexts.eval_ctx) (args : tvalue list)
+    (args_places : mplace option list) (dest : symbolic_value)
+    (dest_place : mplace option) (e : expr) : expr =
+  synthesize_function_call span (FnPtr call_id) ctx None [] empty_generic_args
+    args args_places dest dest_place e
+
 let synthesize_unary_op (span : Meta.span) (ctx : Contexts.eval_ctx)
     (unop : unop) (arg : tvalue) (arg_place : mplace option)
     (dest : symbolic_value) (dest_place : mplace option) (e : expr) : expr =

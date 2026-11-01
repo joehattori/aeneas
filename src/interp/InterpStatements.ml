@@ -1247,7 +1247,8 @@ and eval_function_call_symbolic (config : config) (span : Meta.span)
     (call : call) : stl_cm_fun =
  fun ctx ->
   match call.func with
-  | FnOpDynamic _ -> [%craise] span "Function pointers are not supported yet"
+  | FnOpDynamic (fn_op, _) ->
+      eval_fn_ptr_call_symbolic config span fn_op call.args call.dest ctx
   | FnOpRegular func ->
       [%ltrace
         "function call:\n- call: " ^ call_to_string ctx call ^ "\n- fn_ptr : "
@@ -1261,6 +1262,57 @@ and eval_function_call_symbolic (config : config) (span : Meta.span)
       (* Evaluate the function call *)
       eval_function_call_symbolic_from_inst_sig config call_info call.args
         call.dest ctx
+
+(** Evaluate a call through a function pointer in symbolic mode.
+
+    We only support function pointers whose signature doesn't contain regions:
+    the call then neither consumes nor returns borrows, and we simply introduce
+    a fresh symbolic value for the result. In the symbolic AST, the function
+    pointer is the first argument of the call. *)
+and eval_fn_ptr_call_symbolic (config : config) (span : Meta.span)
+    (fn_op : operand) (args : operand list) (dest : place) : stl_cm_fun =
+ fun ctx ->
+  let fn_ty =
+    match fn_op with
+    | Copy p | Move p -> p.ty
+    | Constant c -> c.ty
+  in
+  let output =
+    match fn_ty with
+    | TFnPtr binder ->
+        let { inputs; output; _ } : fun_sig = binder.binder_value in
+        let has_regions ty =
+          TypesUtils.ty_has_regions_in_pred_aux None (fun _ -> true) ty
+        in
+        [%cassert] span
+          (binder.binder_regions = []
+          && not (List.exists has_regions (output :: inputs)))
+          "Calls through function pointers with regions are not supported yet";
+        [%sanity_check] span (List.length args = List.length inputs);
+        output
+    | _ -> [%craise] span "Expected a function pointer"
+  in
+  (* Unique identifier for the call *)
+  let call_id = ctx.fresh_fun_call_id () in
+  (* Generate a fresh symbolic value for the return value *)
+  let ret_spc = mk_fresh_symbolic_value span ctx output in
+  let ret_value = mk_tvalue_from_symbolic_value ret_spc in
+  let args = fn_op :: args in
+  let args_places =
+    List.map (fun p -> S.mk_opt_place_from_op span p ctx) args
+  in
+  let dest_place = Some (S.mk_mplace span dest ctx) in
+  (* Evaluate the function pointer and the input operands *)
+  let args, ctx, cc = eval_operands config span args ctx in
+  (* Synthesize the symbolic AST *)
+  let cc =
+    cc_comp cc
+      (S.synthesize_fn_ptr_call span call_id ctx args args_places ret_spc
+         dest_place)
+  in
+  (* Move the return value to its destination *)
+  let ctx, cc = comp cc (assign_to_place config span ret_value dest ctx) in
+  ([ (ctx, Unit) ], cc_singleton __FILE__ __LINE__ span cc)
 
 (** Evaluate a local (i.e., non-builtin) function call in concrete mode *)
 and eval_non_builtin_function_call_concrete (config : config) (span : Meta.span)

@@ -38,6 +38,9 @@ type call_id =
   | Fun of fn_ptr_kind * FunCallId.id
       (** A "regular" function (i.e., a function which is not a primitive
           operation) *)
+  | FnPtr of FunCallId.id
+      (** A call through a function pointer: the pointer is the first argument
+      *)
   | Unop of unop
   | Binop of binop
 [@@deriving show, ord]

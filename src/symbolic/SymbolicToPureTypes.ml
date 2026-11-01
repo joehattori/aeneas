@@ -186,8 +186,14 @@ let rec translate_sty (span : Meta.span option) (ty : T.ty) : ty =
         (generics = TypesUtils.empty_generic_args)
         "Unimplemented";
       TTraitType (trait_ref, type_name)
-  | TFnDef _ | TFnPtr _ ->
-      [%craise_opt_span] span "Arrow types are not supported yet"
+  | TFnDef _ -> [%craise_opt_span] span "Arrow types are not supported yet"
+  | TFnPtr binder ->
+      (* A function pointer becomes the type of the forward function: the
+         regions are erased *)
+      let { T.inputs; output; _ } = binder.binder_value in
+      mk_arrows
+        (List.map (translate span) inputs)
+        (mk_result_ty (translate span output))
   | TDynTrait { binder } ->
       let params, _predicates =
         translate_generic_params span binder.binder_params
@@ -425,7 +431,11 @@ let rec translate_fwd_ty (span : Meta.span option) (decls_ctx : C.decls_ctx)
           let subst = make_subst_from_generics sg.generics generics in
           ty_substitute subst sigs.ty
       | T.TraitMethod _ -> [%craise_opt_span] span "Unimplemented")
-  | TFnPtr _ -> [%craise_opt_span] span "Arrow types are not supported yet"
+  | TFnPtr binder ->
+      (* A function pointer becomes the type of the forward function: the
+         regions are erased *)
+      let { T.inputs; output; _ } = binder.binder_value in
+      mk_arrows (List.map translate inputs) (mk_result_ty (translate output))
   | TDynTrait { binder } ->
       let params, _predicates =
         translate_generic_params span binder.binder_params
@@ -542,10 +552,10 @@ and compute_back_ty_num_levels (span : Meta.span option)
           (generics = TypesUtils.empty_generic_args)
           "Unimplemented";
         save_count outer_regions
-    | TFnDef _ ->
-        (* A function item is a zero-sized value: it carries no borrow. *)
+    | TFnDef _ | TFnPtr _ ->
+        (* A function item is a zero-sized value, and a function pointer is a
+           code address: neither carries a borrow. *)
         save_count outer_regions
-    | TFnPtr _ -> [%craise_opt_span] span "Arrow types are not supported yet"
     | TDynTrait _ -> save_count outer_regions
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
@@ -678,10 +688,10 @@ and translate_back_ty_aux (span : Meta.span option) (decls_ctx : C.decls_ctx)
           (generics = TypesUtils.empty_generic_args)
           "Unimplemented";
         stop outer_regions ty
-    | TFnDef _ ->
-        (* A function item is a zero-sized value: it carries no borrow. *)
+    | TFnDef _ | TFnPtr _ ->
+        (* A function item is a zero-sized value, and a function pointer is a
+           code address: neither carries a borrow. *)
         stop outer_regions ty
-    | TFnPtr _ -> [%craise_opt_span] span "Arrow types are not supported yet"
     | TDynTrait _ -> stop outer_regions ty
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"

@@ -1,8 +1,5 @@
 //@ [!lean] skip
 //! Generic code instantiated with function items (extracted as `A → Result B`).
-//!
-//! Note: function pointer types (`fn(u8) -> u8`) are not supported by Aeneas;
-//! we use function items instead.
 
 fn incr(x: u8) -> u8 {
     x + 1
