@@ -391,7 +391,29 @@ and translate_function_call (call : S.call) (e : S.expr) (ctx : bs_ctx) : texpr
         | _ -> [%internal_error] ctx.span
       in
       translate_cast_unsize call e ty0 ty1 ctx
+  | S.FnPtr _ -> translate_fn_ptr_call call e ctx
   | _ -> translate_function_call_aux call e ctx
+
+(** Translate a call through a function pointer.
+
+    The function pointer is the first argument. Its type is the type of a
+    forward function without regions (see [eval_fn_ptr_call_symbolic]), so we
+    simply apply it to the remaining arguments. *)
+and translate_fn_ptr_call (call : S.call) (e : S.expr) (ctx : bs_ctx) : texpr =
+  let f, args =
+    match List.map (tvalue_to_texpr ctx call.ctx) call.args with
+    | f :: args -> (f, args)
+    | [] -> [%internal_error] ctx.span
+  in
+  let dest_mplace =
+    translate_opt_mplace (Some call.span) ctx.decls_ctx call.dest_place
+  in
+  let ctx, dest = fresh_var_for_symbolic_value call.dest ctx in
+  let dest = mk_tpat_from_fvar dest_mplace dest in
+  let call_e = [%add_loc] mk_apps ctx.span f args in
+  [%sanity_check] ctx.span (dest.ty = unwrap_result_ty ctx.span call_e.ty);
+  let next_e = translate_expr e ctx in
+  [%add_loc] mk_closed_checked_let ctx true dest call_e next_e
 
 (** Handle the function call cases which are not unsized casts *)
 and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
@@ -738,6 +760,7 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
             in
             (ctx, Binop binop, effect_info, args, [], dest)
         | _ -> [%craise] ctx.span "Unreachable")
+    | S.FnPtr _ -> [%internal_error] ctx.span
   in
   let func = { id = FunOrOp fun_id; generics } in
   let input_tys = (List.map (fun (x : texpr) -> x.ty)) args in
