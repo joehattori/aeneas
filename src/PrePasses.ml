@@ -2535,10 +2535,161 @@ let fix_anon_const_initializers (crate : crate) (f : fun_decl) : fun_decl =
     }
   else f
 
+(** Make the calls to external C-variadic functions (such as [fcntl]) have a
+    fixed number of arguments.
+
+    A C-variadic function takes a variable number of trailing arguments, which
+    we can not express in the pure model. We give each such function without a
+    body an extra type parameter [VA] and an extra input of type [VA], and at
+    every call we pack the trailing arguments into a tuple:
+    {[
+      extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
+
+      fcntl(fd, F_SETFL, flags)
+        ~~>
+      tmp = (flags,);
+      fcntl::<(i32,)>(fd, F_SETFL, move tmp)
+    ]}
+    A call without trailing arguments passes [()].
+
+    We leave the C-variadic functions defined in Rust unchanged: their body
+    accesses the trailing arguments through a [VaList]. *)
+let variadic_external_calls (crate : crate) : crate =
+  (* Update the signatures, and remember the number of fixed inputs *)
+  let num_fixed_inputs = ref FunDeclId.Map.empty in
+  let update_signature (f : fun_decl) : fun_decl =
+    match f.body with
+    | StructuredBody _ -> f
+    | _ when not f.signature.is_variadic -> f
+    | _ ->
+        num_fixed_inputs :=
+          FunDeclId.Map.add f.def_id
+            (List.length f.signature.inputs)
+            !num_fixed_inputs;
+        let index = TypeVarId.of_int (List.length f.generics.types) in
+        let param : type_param = { index; name = "VA"; variance = VaUnknown } in
+        {
+          f with
+          generics = { f.generics with types = f.generics.types @ [ param ] };
+          signature =
+            {
+              f.signature with
+              is_variadic = false;
+              inputs = f.signature.inputs @ [ TVar (Free index) ];
+            };
+        }
+  in
+  let fun_decls = FunDeclId.Map.map update_signature crate.fun_decls in
+  (* Update the calls *)
+  let operand_ty (op : operand) : ty =
+    match op with
+    | Copy p | Move p -> p.ty
+    | Constant c -> c.ty
+  in
+  let update_calls (f : fun_decl) : fun_decl =
+    match f.body with
+    | StructuredBody body when not (FunDeclId.Map.is_empty !num_fixed_inputs) ->
+        let new_locals = ref [] in
+        let _, gen =
+          LocalId.mk_stateful_generator_starting_at_id
+            (LocalId.of_int (List.length body.locals.locals))
+        in
+        let fresh_local ty =
+          let local =
+            {
+              index = gen ();
+              local_ty = ty;
+              name = None;
+              span = f.item_meta.span;
+              drop_flag_for = None;
+            }
+          in
+          new_locals := local :: !new_locals;
+          local.index
+        in
+        let update_statement (st : statement) : statement list =
+          match st.kind with
+          | Call
+              ( ({
+                   func = FnOpRegular ({ kind = Fun fid; generics } as fn_ptr);
+                   _;
+                 } as call),
+                on_unwind )
+            when FunDeclId.Map.mem fid !num_fixed_inputs ->
+              let num_fixed = FunDeclId.Map.find fid !num_fixed_inputs in
+              [%cassert] st.span
+                (List.length call.args >= num_fixed)
+                "Not enough arguments in a call to a C-variadic function";
+              let args, va_args =
+                Collections.List.split_at call.args num_fixed
+              in
+              let va_ty =
+                TypesUtils.mk_tuple_ty
+                  (List.map
+                     (fun op -> TypesUtils.ty_erase_regions (operand_ty op))
+                     va_args)
+              in
+              let va_arg, assign =
+                match va_ty with
+                | TAdt tref ->
+                    let place =
+                      { kind = PlaceLocal (fresh_local va_ty); ty = va_ty }
+                    in
+                    let assign =
+                      {
+                        span = st.span;
+                        statement_id = StatementId.zero;
+                        kind =
+                          Assign
+                            ( place,
+                              Aggregate
+                                (AggregatedAdt (tref, None, None), va_args) );
+                        comments_before = [];
+                      }
+                    in
+                    (Move place, assign)
+                | _ -> [%internal_error] st.span
+              in
+              let fn_ptr =
+                {
+                  fn_ptr with
+                  generics =
+                    { generics with types = generics.types @ [ va_ty ] };
+                }
+              in
+              let call =
+                {
+                  call with
+                  func = FnOpRegular fn_ptr;
+                  args = args @ [ va_arg ];
+                }
+              in
+              assign :: [ { st with kind = Call (call, on_unwind) } ]
+          | _ -> [ st ]
+        in
+        let body_body = map_statement update_statement body.body in
+        let body =
+          {
+            body with
+            body = body_body;
+            locals =
+              {
+                body.locals with
+                locals = body.locals.locals @ List.rev !new_locals;
+              };
+          }
+        in
+        { f with body = StructuredBody body }
+    | _ -> f
+  in
+  let fun_decls = FunDeclId.Map.map update_calls fun_decls in
+  { crate with fun_decls }
+
 let apply_passes (crate : crate) : crate =
   (* Passes that apply to the whole crate *)
   let crate = update_array_default crate in
   let crate = anon_consts_to_calls crate in
+  let crate = variadic_external_calls crate in
   (* Passes that apply to individual function bodies *)
   let function_passes =
     [
