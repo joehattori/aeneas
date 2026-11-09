@@ -972,6 +972,7 @@ let mk_result_ty (ty : ty) : ty =
 
 let mk_error_ty : ty = TAdt (TBuiltin TError, empty_generic_args)
 let mk_fuel_ty : ty = TAdt (TBuiltin TFuel, empty_generic_args)
+let mk_state_ty : ty = TAdt (TBuiltin TState, empty_generic_args)
 
 let mk_error (error : VariantId.id) : texpr =
   let ty = mk_error_ty in
@@ -1131,6 +1132,11 @@ let mk_fuel_fvar (id : FVarId.id) : fvar =
   { id; basename = Some ConstStrings.fuel_basename; ty = mk_fuel_ty }
 
 let mk_fuel_texpr (id : FVarId.id) : texpr = { e = FVar id; ty = mk_fuel_ty }
+
+let mk_state_fvar (id : FVarId.id) : fvar =
+  { id; basename = Some ConstStrings.state_basename; ty = mk_state_ty }
+
+let mk_state_texpr (id : FVarId.id) : texpr = { e = FVar id; ty = mk_state_ty }
 
 (** Convert an **open** pattern to an expression *)
 let rec tpat_to_texpr (span : Meta.span) (pat : tpat) : texpr option =

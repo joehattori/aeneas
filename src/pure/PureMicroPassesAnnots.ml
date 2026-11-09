@@ -240,8 +240,15 @@ let add_type_annotations_to_fun_decl (trans_ctx : trans_ctx)
                 in
                 (* TODO: we shouldn't call `SymbolicToPure` here, there should
                    be a way to translate these signatures earlier. *)
-                SymbolicToPureTypes.translate_fun_sig trans_ctx fid method_sig
-                  (List.map (fun _ -> None) method_sig.item_binder_value.inputs)
+                let sg =
+                  SymbolicToPureTypes.translate_fun_sig trans_ctx fid method_sig
+                    (List.map
+                       (fun _ -> None)
+                       method_sig.item_binder_value.inputs)
+                in
+                if sg.fwd_info.effect_info.stateful then
+                  { sg with inputs = sg.inputs @ [ mk_state_ty ] }
+                else sg
           in
           [%ldebug "signature: " ^ fun_sig_to_string sg];
           (* In case this is a trait method, we need to concatenate the generics

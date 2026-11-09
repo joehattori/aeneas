@@ -55,28 +55,74 @@ let lookup_fn_ptr_info (infos : modules_funs_info) (kind : fn_ptr_kind) :
     fun_info option =
   Option.bind (fun_or_method_id_of_fn_ptr kind) (lookup_fun_info infos)
 
+type fun_group_state = {
+  funs : fun_decl list;
+  mutable group_info : fun_info;
+  is_global_decl_body : bool;
+  group_has_builtin_info : bool;
+  group_has_builtin : bool;
+  direct_fun_deps : FunDeclId.id list;
+  direct_trait_deps : (TraitDeclId.id * Types.TraitMethodId.id) list;
+}
+
 let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
     modules_funs_info =
   let fmt_env = Charon.Print.crate_to_fmt_env m in
+  let name_matcher_ctx : Charon.NameMatcher.ctx =
+    Charon.NameMatcher.ctx_from_crate m
+  in
+  let effectful_patterns : (string * Charon.NameMatcher.pattern * bool ref) list
+      =
+    List.map
+      (fun pat -> (pat, Charon.NameMatcher.parse_pattern pat, ref false))
+      !Config.effectful_patterns
+  in
+  let matches_effectful (name : Types.name) : bool =
+    let matched = ref false in
+    List.iter
+      (fun (_pat_str, pat, used) ->
+        if
+          Charon.NameMatcher.match_name name_matcher_ctx
+            ExtractName.default_match_config pat name
+        then (
+          used := true;
+          matched := true))
+      effectful_patterns;
+    !matched
+  in
+  let fn_ptr_uses : (Meta.span * FunOrMethodId.id) list ref = ref [] in
+  let dyn_trait_uses : (Meta.span * TraitDeclId.id) list ref = ref [] in
+  let direct_effectful_error_funs : FunDeclId.TreeSet.t ref =
+    ref FunDeclId.TreeSet.empty
+  in
+  let fun_groups : fun_group_state list ref = ref [] in
   let infos = ref { infos = FunOrMethodId.Map.empty } in
   let register_info (id : FunOrMethodId.id) (info : fun_info) : unit =
     assert (not (FunOrMethodId.Map.mem id !infos.infos));
+    infos := { infos = FunOrMethodId.Map.add id info !infos.infos }
+  in
+  let set_info (id : FunOrMethodId.id) (info : fun_info) : unit =
     infos := { infos = FunOrMethodId.Map.add id info !infos.infos }
   in
   let register_fun_decl_info (id : FunDeclId.id) (info : fun_info) : unit =
     register_info (FunOrMethodId.Fun id) info
   in
   let register_trait_method_info (trait_decl_id : TraitDeclId.id)
-      (method_id : Types.TraitMethodId.id) : unit =
+      (method_id : Types.TraitMethodId.id) (stateful : bool) : unit =
     register_info
       (FunOrMethodId.Method (trait_decl_id, method_id))
-      { can_fail = true; stateful = false; can_diverge = false; is_rec = false }
+      { can_fail = true; stateful; can_diverge = false; is_rec = false }
   in
 
   TraitDeclId.Map.iter
     (fun trait_decl_id (trait_decl : trait_decl) ->
       Types.TraitMethodId.Map.iter
-        (fun method_id _ -> register_trait_method_info trait_decl_id method_id)
+        (fun method_id (bound_method : trait_method Types.binder) ->
+          let stateful =
+            effectful_patterns <> []
+            && matches_effectful bound_method.binder_value.item_meta.name
+          in
+          register_trait_method_info trait_decl_id method_id stateful)
         trait_decl.methods)
     m.trait_decls;
 
@@ -90,14 +136,16 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
    * of function calls.
    *)
   let analyze_fun_decls (fun_ids : FunDeclId.TreeSet.t) (d : fun_decl list) :
-      fun_info =
+      fun_group_state =
     let can_fail = ref false in
     let stateful = ref false in
     let can_diverge = ref false in
     let is_rec = ref false in
     let group_has_builtin_info = ref false in
-    let name_matcher_ctx : Charon.NameMatcher.ctx =
-      Charon.NameMatcher.ctx_from_crate m
+    let group_has_builtin = ref false in
+    let direct_fun_deps : FunDeclId.id list ref = ref [] in
+    let direct_trait_deps : (TraitDeclId.id * Types.TraitMethodId.id) list ref =
+      ref []
     in
 
     (* We have some specialized knowledge of some library functions; we don't
@@ -108,6 +156,27 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
       let open ExtractBuiltin in
       NameMatcherMap.find_opt name_matcher_ctx f.item_meta.name
         (builtin_fun_effects_map ())
+    in
+
+    let dyn_ty_visitor =
+      object
+        inherit [_] iter_statement as super
+
+        method! visit_TDynTrait env ({ Types.binder } as dp) =
+          List.iter
+            (fun (c : Types.trait_param) ->
+              dyn_trait_uses :=
+                (env, c.trait.binder_value.id) :: !dyn_trait_uses)
+            binder.binder_params.trait_clauses;
+          super#visit_TDynTrait env dp
+
+        method! visit_trait_ref env (tr : Types.trait_ref) =
+          (match tr.kind with
+          | Dyn ->
+              dyn_trait_uses := (env, tr.trait_decl_ref.id) :: !dyn_trait_uses
+          | _ -> ());
+          super#visit_trait_ref env tr
+      end
     in
 
     (* JP: Why not use a reduce visitor here with a tuple of the values to be
@@ -128,7 +197,8 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
             if FunDeclId.TreeSet.mem id fun_ids then (
               can_diverge := true;
               is_rec := true)
-            else
+            else (
+              direct_fun_deps := id :: !direct_fun_deps;
               let info = lookup_fun_decl_info !infos id in
               let info =
                 [%unwrap_opt_span] (Some span) info
@@ -138,14 +208,46 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
               in
               self#may_fail info.can_fail;
               stateful := !stateful || info.stateful;
-              can_diverge := !can_diverge || info.can_diverge
+              can_diverge := !can_diverge || info.can_diverge)
+
+          method! visit_TDynTrait env ({ Types.binder } as dp) =
+            if effectful_patterns <> [] then
+              List.iter
+                (fun (c : Types.trait_param) ->
+                  dyn_trait_uses :=
+                    (env, c.trait.binder_value.id) :: !dyn_trait_uses)
+                binder.binder_params.trait_clauses;
+            super#visit_TDynTrait env dp
+
+          method! visit_trait_ref env (tr : Types.trait_ref) =
+            (if effectful_patterns <> [] then
+               match tr.kind with
+               | Dyn ->
+                   dyn_trait_uses :=
+                     (env, tr.trait_decl_ref.id) :: !dyn_trait_uses
+               | _ -> ());
+            super#visit_trait_ref env tr
+
+          method! visit_constant_expr_kind env ck =
+            (if effectful_patterns <> [] then
+               match ck with
+               | CFnDef (ptr : Types.fn_ptr) ->
+                   let id =
+                     match ptr.Types.kind with
+                     | Fun id -> FunOrMethodId.Fun id
+                     | TraitMethod (trait_ref, method_id) ->
+                         FunOrMethodId.of_trait_method trait_ref method_id
+                   in
+                   fn_ptr_uses := (env, id) :: !fn_ptr_uses
+               | _ -> ());
+            super#visit_constant_expr_kind env ck
 
           method! visit_Assert env a =
             self#may_fail true;
             super#visit_Assert env a
 
           method! visit_rvalue env rv =
-            match rv with
+            (match rv with
             | Use (Constant { kind = CTraitConst _; _ }, _) ->
                 (* We consider that trait constants can fail, similarly to
                    trait methods. *)
@@ -174,20 +276,31 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
                     | None -> ()))
             | UnaryOp (uop, _) -> can_fail := unop_can_fail uop || !can_fail
             | BinaryOp (bop, _, _) ->
-                can_fail := binop_can_fail bop || !can_fail
+                can_fail := binop_can_fail bop || !can_fail);
+            super#visit_rvalue env rv
 
           method! visit_Call env call dest on_unwind =
             (match call.func with
             | FnOpDynamic _ ->
                 (* Ignoring this: we lookup the called function upon creating
-                   the closure *)
+                   the closure / function pointer *)
                 ()
             | FnOpRegular func -> (
                 match func.kind with
                 | Fun id -> self#visit_fid env id
-                | TraitMethod _ ->
-                    (* We consider trait functions can fail, but can not diverge and are not stateful.
-                       TODO: this may cause issues if we use use a fuel parameter.
+                | TraitMethod (trait_ref, method_id) ->
+                    direct_trait_deps :=
+                      (trait_ref.trait_decl_ref.id, method_id)
+                      :: !direct_trait_deps;
+                    (if effectful_patterns <> [] then
+                       match
+                         lookup_fun_info !infos
+                           (FunOrMethodId.of_trait_method trait_ref method_id)
+                       with
+                       | Some info -> stateful := !stateful || info.stateful
+                       | None -> ());
+                    (* We consider trait functions can fail and cannot diverge.
+                       TODO: this may cause issues if we use a fuel parameter.
                     *)
                     can_fail := true));
             super#visit_Call env call dest on_unwind
@@ -201,13 +314,34 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
             super#visit_Loop env loop
         end
       in
-      (* Sanity check: global bodies don't contain stateful calls *)
-      [%cassert] f.item_meta.span
-        ((not (fun_decl_is_global_initializer f)) || not !stateful)
-        "Global definition containing a stateful call in its body";
       let builtin_info = get_builtin_info f in
       let has_builtin_info = builtin_info <> None in
+      let is_builtin =
+        has_builtin_info
+        || ExtractBuiltin.NameMatcherMap.mem name_matcher_ctx f.item_meta.name
+             (ExtractBuiltin.builtin_funs_map ())
+      in
       group_has_builtin_info := !group_has_builtin_info || has_builtin_info;
+      group_has_builtin := !group_has_builtin || is_builtin;
+      if effectful_patterns <> [] then (
+        dyn_ty_visitor#visit_generic_params f.item_meta.span f.generics;
+        List.iter (dyn_ty_visitor#visit_ty f.item_meta.span) f.signature.inputs;
+        dyn_ty_visitor#visit_ty f.item_meta.span f.signature.output;
+        if matches_effectful f.item_meta.name then (
+          let name_str = Charon.Print.name_to_string fmt_env f.item_meta.name in
+          if is_builtin then (
+            direct_effectful_error_funs :=
+              FunDeclId.TreeSet.add f.def_id !direct_effectful_error_funs;
+            [%save_error] f.item_meta.span
+              ("Builtin function '" ^ name_str
+             ^ "' cannot be marked `-effectful`"));
+          if fun_decl_is_global_initializer f then (
+            direct_effectful_error_funs :=
+              FunDeclId.TreeSet.add f.def_id !direct_effectful_error_funs;
+            [%save_error] f.item_meta.span
+              ("Global initializer '" ^ name_str
+             ^ "' cannot be marked `-effectful`"));
+          obj#maybe_stateful true));
       match f.body with
       | StructuredBody body -> obj#visit_block body.body.span body.body
       | TargetDispatchBody targets ->
@@ -245,13 +379,24 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
      *)
     can_fail :=
       if is_global_decl_body then !can_fail
-      else if !group_has_builtin_info then !can_fail
+      else if !group_has_builtin_info then !can_fail || !stateful
       else true;
+    let group_info =
+      {
+        can_fail = !can_fail;
+        stateful = !stateful;
+        can_diverge = !can_diverge;
+        is_rec = !is_rec;
+      }
+    in
     {
-      can_fail = !can_fail;
-      stateful = !stateful;
-      can_diverge = !can_diverge;
-      is_rec = !is_rec;
+      funs = d;
+      group_info;
+      is_global_decl_body;
+      group_has_builtin_info = !group_has_builtin_info;
+      group_has_builtin = !group_has_builtin;
+      direct_fun_deps = !direct_fun_deps;
+      direct_trait_deps = !direct_trait_deps;
     }
   in
 
@@ -265,8 +410,11 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
     in
     let fun_ids = List.map (fun (d : fun_decl) -> d.def_id) funs in
     let fun_ids = FunDeclId.TreeSet.of_list fun_ids in
-    let info = analyze_fun_decls fun_ids funs in
-    List.iter (fun (f : fun_decl) -> register_fun_decl_info f.def_id info) funs
+    let group = analyze_fun_decls fun_ids funs in
+    if effectful_patterns <> [] then fun_groups := group :: !fun_groups;
+    List.iter
+      (fun (f : fun_decl) -> register_fun_decl_info f.def_id group.group_info)
+      funs
   in
 
   let rec analyze_decl_groups (decls : declaration_group list) : unit =
@@ -277,7 +425,6 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
     | FunGroup decl :: decls' ->
         (try analyze_fun_decl_group (g_declaration_group_to_list decl)
          with CFailure error ->
-           let fmt_env = Charon.Print.crate_to_fmt_env m in
            let decls = Charon.GAstUtils.g_declaration_group_to_list decl in
            let decl_id_to_string (id : FunDeclId.id) : string =
              match FunDeclId.Map.find_opt id m.fun_decls with
@@ -307,5 +454,259 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
   in
 
   analyze_decl_groups (Option.get m.declarations);
+
+  if effectful_patterns <> [] then (
+    let fun_groups = List.rev !fun_groups in
+    let fun_group_by_id =
+      List.fold_left
+        (fun acc (g : fun_group_state) ->
+          List.fold_left
+            (fun acc (f : fun_decl) -> FunDeclId.TreeMap.add f.def_id g acc)
+            acc g.funs)
+        FunDeclId.TreeMap.empty fun_groups
+    in
+    let is_fun_stateful (id : FunDeclId.id) : bool =
+      match lookup_fun_decl_info !infos id with
+      | Some info -> info.stateful
+      | None -> false
+    in
+    let is_trait_method_stateful (td_id : TraitDeclId.id)
+        (mid : Types.TraitMethodId.id) : bool =
+      match lookup_fun_info !infos (FunOrMethodId.Method (td_id, mid)) with
+      | Some info -> info.stateful
+      | None -> false
+    in
+    let mark_group_stateful (g : fun_group_state) : bool =
+      if g.group_info.stateful then false
+      else
+        let can_fail =
+          if g.is_global_decl_body then g.group_info.can_fail
+          else if g.group_has_builtin_info then true
+          else g.group_info.can_fail
+        in
+        let info = { g.group_info with stateful = true; can_fail } in
+        g.group_info <- info;
+        List.iter
+          (fun (f : fun_decl) -> set_info (FunOrMethodId.Fun f.def_id) info)
+          g.funs;
+        true
+    in
+    let mark_fun_id_stateful (fid : FunDeclId.id) : bool =
+      match FunDeclId.TreeMap.find_opt fid fun_group_by_id with
+      | Some g -> mark_group_stateful g
+      | None -> false
+    in
+    let mark_trait_method_stateful (td_id : TraitDeclId.id)
+        (mid : Types.TraitMethodId.id) : bool =
+      let key = FunOrMethodId.Method (td_id, mid) in
+      match lookup_fun_info !infos key with
+      | Some info when info.stateful -> false
+      | Some info ->
+          set_info key { info with stateful = true };
+          true
+      | None ->
+          set_info key
+            {
+              can_fail = true;
+              stateful = true;
+              can_diverge = false;
+              is_rec = false;
+            };
+          true
+    in
+
+    (* Iterate statefulness propagation to a fixed point across functions,
+       trait declarations (default methods), and trait implementations. *)
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      List.iter
+        (fun (g : fun_group_state) ->
+          if
+            (not g.group_info.stateful)
+            && (List.exists is_fun_stateful g.direct_fun_deps
+               || List.exists
+                    (fun (td_id, mid) -> is_trait_method_stateful td_id mid)
+                    g.direct_trait_deps)
+          then if mark_group_stateful g then changed := true)
+        fun_groups;
+      TraitDeclId.Map.iter
+        (fun td_id (trait_decl : trait_decl) ->
+          Types.TraitMethodId.Map.iter
+            (fun mid (bound_method : trait_method Types.binder) ->
+              match bound_method.binder_value.default with
+              | Some fref ->
+                  if is_fun_stateful fref.id then
+                    if mark_trait_method_stateful td_id mid then changed := true;
+                  if is_trait_method_stateful td_id mid then
+                    if mark_fun_id_stateful fref.id then changed := true
+              | None -> ())
+            trait_decl.methods)
+        m.trait_decls;
+      TraitImplId.Map.iter
+        (fun _ (trait_impl : trait_impl) ->
+          let td_id = trait_impl.impl_trait.id in
+          Types.TraitMethodId.Map.iter
+            (fun mid (fref_binder : Types.fun_decl_ref Types.binder) ->
+              let fid = fref_binder.binder_value.id in
+              if is_fun_stateful fid then
+                if mark_trait_method_stateful td_id mid then changed := true;
+              if is_trait_method_stateful td_id mid then
+                if mark_fun_id_stateful fid then changed := true)
+            trait_impl.methods)
+        m.trait_impls
+    done;
+
+    (* Warn on `-effectful` patterns that matched no function or trait method *)
+    List.iter
+      (fun (pat_str, _pat, used) ->
+        if not !used then
+          [%warn_opt_span] None
+            ("`-effectful` pattern `" ^ pat_str
+           ^ "` did not match any function or trait method declaration"))
+      effectful_patterns;
+
+    (* Check that no global initializer or builtin function became stateful *)
+    List.iter
+      (fun (g : fun_group_state) ->
+        if g.group_info.stateful then (
+          if g.is_global_decl_body then
+            List.iter
+              (fun (f : fun_decl) ->
+                if
+                  fun_decl_is_global_initializer f
+                  && not
+                       (FunDeclId.TreeSet.mem f.def_id
+                          !direct_effectful_error_funs)
+                then
+                  [%save_error] f.item_meta.span
+                    "Global definition containing a stateful call in its body")
+              g.funs;
+          if g.group_has_builtin then
+            List.iter
+              (fun (f : fun_decl) ->
+                if
+                  not
+                    (FunDeclId.TreeSet.mem f.def_id
+                       !direct_effectful_error_funs)
+                then
+                  let name_str =
+                    Charon.Print.name_to_string fmt_env f.item_meta.name
+                  in
+                  [%save_error] f.item_meta.span
+                    ("Builtin function '" ^ name_str ^ "' cannot be stateful"))
+              g.funs))
+      fun_groups;
+
+    (* Index a representative local trait impl span per trait decl to give clear
+       user-facing spans when a builtin or external trait (e.g. a closure) becomes
+       stateful. *)
+    let stateful_impl_spans : Meta.span TraitDeclId.TreeMap.t ref =
+      ref TraitDeclId.TreeMap.empty
+    in
+    TraitImplId.Map.iter
+      (fun _ (trait_impl : trait_impl) ->
+        let td_id = trait_impl.impl_trait.id in
+        if
+          trait_impl.item_meta.is_local
+          && (not (TraitDeclId.TreeMap.mem td_id !stateful_impl_spans))
+          && Types.TraitMethodId.Map.exists
+               (fun mid _ -> is_trait_method_stateful td_id mid)
+               trait_impl.methods
+        then
+          stateful_impl_spans :=
+            TraitDeclId.TreeMap.add td_id trait_impl.item_meta.span
+              !stateful_impl_spans)
+      m.trait_impls;
+
+    (* Check that no builtin or external trait has a stateful method *)
+    FunOrMethodId.Map.iter
+      (fun id (info : fun_info) ->
+        match id with
+        | FunOrMethodId.Method (td_id, mid) when info.stateful -> (
+            let impl_span =
+              TraitDeclId.TreeMap.find_opt td_id !stateful_impl_spans
+            in
+            let method_name = Charon.GAstUtils.get_method_name m td_id mid in
+            match TraitDeclId.Map.find_opt td_id m.trait_decls with
+            | None ->
+                [%save_error_opt_span] impl_span
+                  ("External trait method '" ^ method_name
+                 ^ "' cannot be effectful")
+            | Some td ->
+                let is_builtin_trait =
+                  ExtractBuiltin.NameMatcherMap.mem name_matcher_ctx
+                    td.item_meta.name
+                    (ExtractBuiltin.builtin_trait_decls_map ())
+                in
+                if is_builtin_trait || not td.item_meta.is_local then
+                  let kind_str =
+                    if is_builtin_trait then "Builtin" else "External"
+                  in
+                  let span =
+                    match impl_span with
+                    | Some s -> s
+                    | None -> td.item_meta.span
+                  in
+                  [%save_error] span
+                    (kind_str ^ " trait method '" ^ method_name ^ "' of trait '"
+                    ^ Charon.Print.name_to_string fmt_env td.item_meta.name
+                    ^ "' cannot be effectful"))
+        | _ -> ())
+      !infos.infos;
+
+    (* Check function pointers: stateful functions or trait methods cannot be taken as function pointers *)
+    List.iter
+      (fun (span, (id : FunOrMethodId.id)) ->
+        let is_stateful =
+          match lookup_fun_info !infos id with
+          | Some info -> info.stateful
+          | None -> false
+        in
+        if is_stateful then
+          let item_name =
+            match id with
+            | FunOrMethodId.Fun fid -> (
+                match FunDeclId.Map.find_opt fid m.fun_decls with
+                | Some d -> Charon.Print.name_to_string fmt_env d.item_meta.name
+                | None -> FunDeclId.to_string fid)
+            | FunOrMethodId.Method (td_id, mid) ->
+                Charon.GAstUtils.get_method_name m td_id mid
+          in
+          [%save_error] span
+            ("Effectful function or trait method '" ^ item_name
+           ^ "' cannot be used as a function pointer"))
+      !fn_ptr_uses;
+
+    (* Check trait objects: traits with any stateful method cannot be used with `dyn` *)
+    let rec trait_has_stateful_method (visited : TraitDeclId.TreeSet.t)
+        (td_id : TraitDeclId.id) : bool =
+      if TraitDeclId.TreeSet.mem td_id visited then false
+      else
+        let visited = TraitDeclId.TreeSet.add td_id visited in
+        match TraitDeclId.Map.find_opt td_id m.trait_decls with
+        | None -> false
+        | Some td ->
+            Types.TraitMethodId.Map.exists
+              (fun mid _ -> is_trait_method_stateful td_id mid)
+              td.methods
+            || List.exists
+                 (fun (c : Types.trait_param) ->
+                   trait_has_stateful_method visited c.trait.binder_value.id)
+                 td.implied_clauses
+    in
+    List.iter
+      (fun (span, td_id) ->
+        if trait_has_stateful_method TraitDeclId.TreeSet.empty td_id then
+          let trait_name =
+            match TraitDeclId.Map.find_opt td_id m.trait_decls with
+            | Some td -> Charon.Print.name_to_string fmt_env td.item_meta.name
+            | None -> TraitDeclId.to_string td_id
+          in
+          [%save_error] span
+            ("Trait '" ^ trait_name
+           ^ "' has effectful methods and cannot be used as a `dyn` trait \
+              object"))
+      !dyn_trait_uses);
 
   !infos

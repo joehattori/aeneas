@@ -216,6 +216,11 @@ let always_deconstruct_adts_with_matches = ref false
 (** Controls whether we use fuel to control termination. *)
 let use_fuel = ref false
 
+(** Patterns matching functions whose declarations (and transitive callers) are
+    treated as stateful, threading an explicit `State` argument and return
+    value. *)
+let effectful_patterns : string list ref = ref []
+
 (** Controls whether we split the generated definitions between different files
     for the types, clauses and functions, or if we group them in one file. *)
 let split_files = ref false

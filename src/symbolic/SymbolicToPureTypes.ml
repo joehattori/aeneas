@@ -743,6 +743,8 @@ and compute_raw_fun_effect_info (span : Meta.span option)
           (lookup_pure_fn_ptr_info fun_infos fun_id)
       in
       {
+        stateful_group = info.stateful;
+        stateful = info.stateful && gid = None;
         (* Note that backward functions can't fail *)
         can_fail = info.can_fail && gid = None;
         can_diverge = info.can_diverge;
@@ -976,9 +978,17 @@ and translate_inst_fun_sig_to_decomposed_fun_type (span : Meta.span option)
          let push T (v : Vec T) (x : T) : Result (Vec T) = ...
        ]}
     *)
+    [%cassert_opt_span] span
+      ((not fwd_effect_info.stateful) || inputs = [])
+      "Effectful functions with backward functions taking additional inputs \
+       are not supported";
     let back_effect_info =
       let b = inputs <> [] in
-      { back_effect_info with can_fail = back_effect_info.can_fail && b }
+      {
+        back_effect_info with
+        stateful = back_effect_info.stateful && b;
+        can_fail = back_effect_info.can_fail && b;
+      }
     in
     let outputs = compute_back_outputs_for_gid gid in
     let filter =

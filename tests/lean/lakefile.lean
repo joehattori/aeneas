@@ -41,6 +41,7 @@ package «tests» {}
 @[default_target] lean_lib DropBug
 @[default_target] lean_lib Dyn
 @[default_target] lean_lib DynamicSize
+@[default_target] lean_lib Effectful
 @[default_target] lean_lib ExternalEntrypoint
 @[default_target] lean_lib FnItemConstructors
 @[default_target] lean_lib FnItemLateBound

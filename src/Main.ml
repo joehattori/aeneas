@@ -121,6 +121,10 @@ let () =
       ( "-use-fuel",
         Arg.Set use_fuel,
         " Use a fuel parameter to control divergence" );
+      ( "-effectful",
+        Arg.String (fun s -> effectful_patterns := !effectful_patterns @ [ s ]),
+        " Mark functions matching the given name pattern (and transitively \
+         their callers) as effectful, threading an explicit `State`" );
       ( "-no-template-clauses",
         Arg.Clear extract_template_decreases_clauses,
         " Do not generate templates for the required decreases \
@@ -466,6 +470,17 @@ let () =
   (* Sanity check: the use of decrease clauses is not compatible with the use of fuel *)
   check_arg_not !use_fuel "-use-fuel" !extract_decreases_clauses
     "-decreases-clauses";
+  List.iter
+    (fun pat ->
+      try ignore (Charon.NameMatcher.parse_pattern pat) with
+      | Failure msg ->
+          fail_with_error_no_doc
+            ("Invalid pattern provided to `-effectful`: '" ^ pat ^ "': " ^ msg)
+      | e ->
+          fail_with_error_no_doc
+            ("Invalid pattern provided to `-effectful`: '" ^ pat ^ "': "
+           ^ Printexc.to_string e))
+    !effectful_patterns;
   check_arg_implies !generate_lib_entry_point "-gen-lib-entry" !split_files
     "-split-files";
   check_arg_not !generate_lib_entry_point "-gen-lib-entry"
@@ -494,6 +509,9 @@ let () =
     check_not !extract_decreases_clauses
       "Options -borrow-check and -decreases-clauses are not compatible";
     check_not !use_fuel "Options -borrow-check and -use-fuel are not compatible";
+    check_not
+      (!effectful_patterns <> [])
+      "Options -borrow-check and -effectful are not compatible";
     check_not !split_files
       "Options -borrow-check and -split-files are not compatible");
   check_arg_not

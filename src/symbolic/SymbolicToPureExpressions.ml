@@ -570,7 +570,13 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
               | _ -> [%craise] ctx.span "Unreachable"
             in
             let effect_info =
-              { can_fail = false; can_diverge = false; is_rec = false }
+              {
+                stateful_group = false;
+                stateful = false;
+                can_fail = false;
+                can_diverge = false;
+                is_rec = false;
+              }
             in
             let ctx, dest = fresh_var_for_symbolic_value call.dest ctx in
             let dest = mk_tpat_from_fvar dest_mplace dest in
@@ -584,6 +590,8 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
              * is thus monadic) *)
             let effect_info =
               {
+                stateful_group = false;
+                stateful = false;
                 can_fail = overflow <> OWrap;
                 can_diverge = false;
                 is_rec = false;
@@ -686,7 +694,15 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
               [%craise] ctx.span "Unsupported: `dyn Trait` concretization"
         in
         (* Note that casts can fail *)
-        let effect_info = { can_fail; can_diverge = false; is_rec = false } in
+        let effect_info =
+          {
+            stateful_group = false;
+            stateful = false;
+            can_fail;
+            can_diverge = false;
+            is_rec = false;
+          }
+        in
         let ctx, dest = fresh_var_for_symbolic_value call.dest ctx in
         let dest = mk_tpat_from_fvar dest_mplace dest in
         (ctx, Unop (Cast kind), effect_info, args, [], dest)
@@ -702,6 +718,8 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
         | [ arg0; arg1 ] ->
             let effect_info =
               {
+                stateful_group = false;
+                stateful = false;
                 can_fail = ExpressionsUtils.binop_can_fail binop;
                 can_diverge = false;
                 is_rec = false;
@@ -1707,6 +1725,10 @@ and translate_intro_symbolic (ectx : C.eval_ctx) (p : S.mplace option)
                  have to lift it *)
               [%cassert] ctx.span sg.sg.fwd_info.effect_info.can_fail
                 "Unimplemented";
+              [%cassert] ctx.span
+                (not sg.sg.fwd_info.effect_info.stateful)
+                "Effectful functions cannot be used as function pointers or \
+                 closures";
               [%cassert] ctx.span
                 (RegionGroupId.Map.for_all
                    (fun _ (e : fun_effect_info) -> not e.can_fail)

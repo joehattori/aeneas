@@ -8,3 +8,6 @@ let error_basename = "e"
 
 (** Basename for the fuel variable *)
 let fuel_basename = "n"
+
+(** Basename for the state variable *)
+let state_basename = "st"

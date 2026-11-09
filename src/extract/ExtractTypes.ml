@@ -519,6 +519,7 @@ let rec extract_ty (span : Meta.span) (ctx : extraction_ctx) (fmt : F.formatter)
             let visitor =
               object
                 inherit [_] iter_ty
+
                 method! visit_TVar _ var =
                   match var with
                   | Bound _ -> ()
@@ -2208,3 +2209,82 @@ let extract_type_decl_extra_info (ctx : extraction_ctx) (fmt : F.formatter)
         if backend () = Lean then
           extract_type_decl_record_field_projectors_simp_lemmas ctx fmt kind
             decl)
+
+(** Extract the state type declaration. *)
+let extract_state_type (fmt : F.formatter) (ctx : extraction_ctx)
+    ?(namespace : string option) (kind : decl_kind) : unit =
+  (* Add a break before *)
+  F.pp_print_break fmt 0 0;
+  (match namespace with
+  | Some ns ->
+      F.pp_print_string fmt ("namespace " ^ ns);
+      F.pp_print_break fmt 0 0;
+      F.pp_print_break fmt 0 0
+  | None -> ());
+  (* Print a comment *)
+  extract_doc_comment fmt [ "The state type used in the state-error monad" ];
+  F.pp_print_break fmt 0 0;
+  (* Open a box for the definition, so that whenever possible it gets printed on
+     one line *)
+  F.pp_open_hvbox fmt 0;
+  (* Retrieve the name *)
+  let state_name = ctx_get_builtin_type None TState ctx in
+  (* The syntax for Lean and Coq is almost identical. *)
+  let print_axiom () =
+    let axiom =
+      match backend () with
+      | Coq -> "Axiom"
+      | Lean -> "axiom"
+      | FStar | HOL4 -> raise (Failure "Unexpected")
+    in
+    F.pp_print_string fmt axiom;
+    F.pp_print_space fmt ();
+    F.pp_print_string fmt state_name;
+    F.pp_print_space fmt ();
+    F.pp_print_string fmt ":";
+    F.pp_print_space fmt ();
+    F.pp_print_string fmt "Type";
+    if backend () = Coq then F.pp_print_string fmt "."
+  in
+  (* The kind should be [Builtin] or [Declared] *)
+  (match kind with
+  | SingleNonRec | SingleRec | MutRecFirst | MutRecInner | MutRecLast ->
+      raise (Failure "Unexpected")
+  | Builtin -> (
+      match backend () with
+      | FStar ->
+          F.pp_print_string fmt "assume";
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt "type";
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt state_name;
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt ":";
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt "Type0"
+      | HOL4 ->
+          F.pp_print_string fmt ("val _ = new_type (\"" ^ state_name ^ "\", 0)")
+      | Coq | Lean -> print_axiom ())
+  | Declared -> (
+      match backend () with
+      | FStar ->
+          F.pp_print_string fmt "val";
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt state_name;
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt ":";
+          F.pp_print_space fmt ();
+          F.pp_print_string fmt "Type0"
+      | HOL4 ->
+          F.pp_print_string fmt ("val _ = new_type (\"" ^ state_name ^ "\", 0)")
+      | Coq | Lean -> print_axiom ()));
+  (* Close the box for the definition *)
+  F.pp_close_box fmt ();
+  (* Add breaks to insert new lines between definitions *)
+  F.pp_print_break fmt 0 0;
+  match namespace with
+  | Some ns ->
+      F.pp_print_break fmt 0 0;
+      F.pp_print_string fmt ("end " ^ ns);
+      F.pp_print_break fmt 0 0
+  | None -> ()

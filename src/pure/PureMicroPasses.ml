@@ -498,9 +498,14 @@ let apply_passes_to_pure_fun_translations (crate : LlbcAst.crate)
        parameter manipulations). *)
     let t0 = if collect_detailed then Unix.gettimeofday () else 0.0 in
     refresh_fvar_id_generator ();
-    let trans = if !Config.use_fuel then add_fuel ctx trans else trans in
+    let trans =
+      if !Config.use_fuel || !Config.effectful_patterns <> [] then
+        add_fuel_and_state ctx trans
+      else trans
+    in
     if collect_detailed then
-      post_timings := ("add_fuel", Unix.gettimeofday () -. t0) :: !post_timings;
+      post_timings :=
+        ("add_fuel_and_state", Unix.gettimeofday () -. t0) :: !post_timings;
 
     (* Collect diagnostic data *)
     if !Config.diagnose_micro_passes then begin
@@ -582,3 +587,5 @@ let apply_passes_to_pure_fun_translations (crate : LlbcAst.crate)
   (* Update the "reducible" attribute *)
   let ctx, _ = create_ctx () in
   compute_reducible ctx transl
+
+let add_state_to_trait_decls = PureMicroPassesGeneral.add_state_to_trait_decls

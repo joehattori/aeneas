@@ -596,6 +596,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
     Micro.apply_passes_to_pure_fun_translations crate trans_ctx type_decls
       trait_impls pure_translations
   in
+  let trait_decls = Micro.add_state_to_trait_decls trait_decls in
 
   (* Return *)
   ( trans_ctx,
@@ -625,6 +626,8 @@ type gen_config = {
           globals or types. TODO: update this. This is not trivial if we want to
           extract the opaque types in an opaque module, because some non-opaque
           types may refer to opaque types and vice-versa. *)
+  extract_state_type : bool;
+      (** If [true], generate a definition/declaration for the state type *)
   extract_globals : bool;
       (** If [true], generate a definition/declaration for top-level (global)
           declarations *)
@@ -1111,8 +1114,8 @@ let export_trait_impl (fmt : Format.formatter) (_config : gen_config)
 (** A generic utility to generate the extracted definitions: as we may want to
     split the definitions between different files (or not), we can control what
     is precisely extracted. *)
-let extract_definitions (fmt : Format.formatter) (config : gen_config)
-    (ctx : gen_ctx) : unit =
+let extract_definitions ?(state_namespace : string option = None)
+    (fmt : Format.formatter) (config : gen_config) (ctx : gen_ctx) : unit =
   (* Export the definition groups to the file, in the proper order.
      - [extract_decl]: extract the type declaration (if not filtered)
      - [extract_extra_info]: extra the extra type information (e.g.,
@@ -1128,6 +1131,13 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
     export_trait_decl fmt config ctx id false true
   in
   let export_trait_impl ~is_rec = export_trait_impl fmt config ctx ~is_rec in
+
+  let export_state_type () : unit =
+    let kind =
+      if config.interface then ExtractBase.Declared else ExtractBase.Builtin
+    in
+    Extract.extract_state_type fmt ctx ?namespace:state_namespace kind
+  in
 
   let export_decl_group (dg : declaration_group) : unit =
     match dg with
@@ -1268,13 +1278,19 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
           "Mixed-recursive declaration groups are not supported"
   in
 
+  if config.extract_state_type && config.extract_fun_decls then
+    export_state_type ();
+
   List.iter
     (fun g ->
       try export_decl_group g
       with CFailure _ ->
         (* An exception was raised: ignore it *)
         ())
-    (Option.get ctx.crate.declarations)
+    (Option.get ctx.crate.declarations);
+
+  if config.extract_state_type && not config.extract_fun_decls then
+    export_state_type ()
 
 type extract_file_info = {
   filename : string;
@@ -1438,7 +1454,11 @@ let extract_file (config : gen_config) (ctx : gen_ctx) (fi : extract_file_info)
   Format.pp_open_vbox fmt 0;
 
   (* Extract the definitions *)
-  extract_definitions fmt config ctx;
+  let state_namespace =
+    if Config.backend () = Lean && not fi.in_namespace then Some fi.namespace
+    else None
+  in
+  extract_definitions ~state_namespace fmt config ctx;
 
   (* Close the box and end the formatting *)
   Format.pp_close_box fmt ();
@@ -1867,9 +1887,24 @@ let extract_translated_crate (filename : string) (dest_dir : string)
 
   (* Check if there are opaque types and functions (we need this to know whether
      we need to generate interface files, etc.) *)
+  let has_stateful_funs =
+    !Config.effectful_patterns <> []
+    && (Pure.FunDeclId.Map.exists
+          (fun _ (trans : pure_fun_translation) ->
+            trans.f.signature.fwd_info.effect_info.stateful)
+          ctx.trans_funs
+       || TraitDeclId.Map.exists
+            (fun _ (decl : Pure.trait_decl) ->
+              List.exists
+                (fun (m : Pure.trait_method) ->
+                  m.signature.fwd_info.effect_info.stateful)
+                decl.methods)
+            ctx.trans_trait_decls)
+  in
   let has_opaque_types, has_opaque_funs =
     crate_has_opaque_non_builtin_decls ctx true
   in
+  let has_opaque_types = has_opaque_types || has_stateful_funs in
   let has_opaque = has_opaque_types || has_opaque_funs in
 
   (* Extract one or several files, depending on the configuration *)
@@ -1884,6 +1919,7 @@ let extract_translated_crate (filename : string) (dest_dir : string)
          extract_trait_impls = false;
          extract_transparent = true;
          extract_opaque = false;
+         extract_state_type = false;
          extract_globals = false;
          interface = false;
        }
@@ -1925,6 +1961,7 @@ let extract_translated_crate (filename : string) (dest_dir : string)
              extract_transparent = false;
              extract_types = true;
              extract_trait_decls = true;
+             extract_state_type = has_stateful_funs;
              interface = true;
            }
          in
@@ -2120,6 +2157,7 @@ let extract_translated_crate (filename : string) (dest_dir : string)
          extract_trait_impls = true;
          extract_transparent = true;
          extract_opaque = true;
+         extract_state_type = has_stateful_funs;
          extract_globals = true;
          interface = false;
        }

@@ -678,23 +678,80 @@ let simplify_let_bindings =
 
     TODO: this micro-pass will not be sound anymore once we allow stateful
     (backward) functions. *)
-let simplify_duplicate_calls_visitor (_ctx : ctx) (def : fun_decl) =
+let expr_contains_stateful_call_aux
+    ~(is_loop_stateful : fun_decl_id -> loop_id -> bool -> bool) (ctx : ctx)
+    (e : texpr) : bool =
+  if !Config.effectful_patterns = [] then false
+  else
+    let exception Found in
+    let visitor =
+      object
+        inherit [_] iter_expr as super
+
+        method! visit_expr env e =
+          (match e with
+          | Qualif { id = FunOrOp (Fun (FromLlbc (fid, lp_id))); _ } -> (
+              match fid with
+              | FunId fid' -> (
+                  match lp_id with
+                  | None -> (
+                      match FunDeclId.Map.find_opt fid' ctx.fun_decls with
+                      | Some decl ->
+                          if decl.signature.fwd_info.effect_info.stateful then
+                            raise Found
+                      | None -> ())
+                  | Some (lp_id, is_body) ->
+                      if is_loop_stateful fid' lp_id is_body then raise Found)
+              | TraitMethod (trait_ref, method_id) -> (
+                  match
+                    FunsAnalysis.lookup_fun_info ctx.trans_ctx.fun_ctx.fun_infos
+                      (LlbcAst.FunOrMethodId.Method
+                         (trait_ref.trait_decl_ref.trait_decl_id, method_id))
+                  with
+                  | Some info -> if info.stateful then raise Found
+                  | None -> ()))
+          | _ -> ());
+          super#visit_expr env e
+      end
+    in
+    try
+      visitor#visit_texpr () e;
+      false
+    with Found -> true
+
+let texpr_contains_stateful_call
+    ?(loops : fun_decl LoopId.Map.t = LoopId.Map.empty)
+    ?(bodies : fun_decl LoopId.Map.t = LoopId.Map.empty) (ctx : ctx) (e : texpr)
+    : bool =
+  expr_contains_stateful_call_aux
+    ~is_loop_stateful:(fun fid' lp_id is_body ->
+      let map = if is_body then bodies else loops in
+      match LoopId.Map.find_opt lp_id map with
+      | Some decl -> decl.signature.fwd_info.effect_info.stateful
+      | None -> (
+          match FunDeclId.Map.find_opt fid' ctx.fun_decls with
+          | Some decl -> decl.signature.fwd_info.effect_info.stateful
+          | None -> false))
+    ctx e
+
+let simplify_duplicate_calls_visitor (ctx : ctx) (def : fun_decl) =
   object (self)
     inherit [_] map_expr as super
 
     method! visit_Let env monadic pat bound next =
       let bound = self#visit_texpr env bound in
       (* Register the function call if the pattern doesn't contain ignored
-         variables *)
+         variables, and the bound expression doesn't call any stateful function *)
       let env =
         let factor =
-          monadic
+          (monadic
           ||
           match destruct_apps bound with
           | { e = FVar _; _ }, _ :: _ ->
               (* May be a backward function call *)
               true
-          | _ -> false
+          | _ -> false)
+          && not (texpr_contains_stateful_call ctx bound)
         in
         if factor then
           match tpat_to_texpr def.item_meta.span pat with
@@ -1200,8 +1257,9 @@ let filter_useless (ctx : ctx) (def : fun_decl) : fun_decl =
               (* Put everything together *)
               (Let (monadic, lv, re, e), used)
             in
-            (* Potentially filter the let-binding *)
-            if all_dummies then
+            (* Potentially filter the let-binding. Never drop a binding whose rhs
+               may invoke a stateful function. *)
+            if all_dummies && not (texpr_contains_stateful_call ctx re) then
               if not monadic then
                 (* Not a monadic let-binding: simple case *)
                 (e.e, used)
@@ -3059,11 +3117,25 @@ let mk_fresh_fuel_var (ctx : ctx) : fvar =
   let id = ctx.fresh_fvar_id () in
   { id; basename = Some ConstStrings.fuel_basename; ty = mk_fuel_ty }
 
-(** Add the fuel parameter, if necessary *)
-let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
-    fun_decl =
+let mk_fresh_state_var (ctx : ctx) : fvar =
+  let id = ctx.fresh_fvar_id () in
+  { id; basename = Some ConstStrings.state_basename; ty = mk_state_ty }
+
+let add_state_to_result_ty (span : Meta.span) (ty : ty) : ty =
+  match opt_destruct_result span ty with
+  | Some inner_ty -> mk_result_ty (mk_simpl_tuple_ty [ mk_state_ty; inner_ty ])
+  | None -> [%internal_error] span
+
+(** Add the fuel and state parameters, if necessary *)
+let add_fuel_and_state_one (ctx : ctx) (loops : fun_decl LoopId.Map.t)
+    (bodies : fun_decl LoopId.Map.t) (def : fun_decl) : fun_decl =
   [%ldebug fun_decl_to_string ctx def];
   let span = def.item_meta.span in
+  let is_loop_body =
+    match def.loop_id with
+    | Some (_, is_body) -> is_body
+    | None -> false
+  in
   (* Open the binders - this is more convenient *)
   let body =
     Option.map (fun b -> snd (open_all_fun_body ctx span b)) def.body
@@ -3082,129 +3154,470 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
   let fuel_expr = Option.map mk_texpr_from_fvar fuel in
   let fuel_ty = Option.map (fun (v : fvar) -> v.ty) fuel in
 
+  let st = if effekt.stateful then Some (mk_fresh_state_var ctx) else None in
+  let st_expr = Option.map mk_texpr_from_fvar st in
+  let st_ty = Option.map (fun (v : fvar) -> v.ty) st in
+
+  let update_loop_body_ret_tys (orig_cont_ty : ty) (orig_break_ty : ty) :
+      ty * ty =
+    let new_cont_ty =
+      if ty_is_unit orig_cont_ty then mk_state_ty
+      else mk_simpl_tuple_ty [ orig_cont_ty; mk_state_ty ]
+    in
+    let new_break_ty = mk_simpl_tuple_ty [ mk_state_ty; orig_break_ty ] in
+    (new_cont_ty, new_break_ty)
+  in
+
+  let update_result_inner_ty (in_loop_body_tail : bool) (inner_ty : ty) : ty =
+    if in_loop_body_tail then
+      match inner_ty with
+      | TAdt
+          (TBuiltin TLoopResult, { types = [ orig_cont_ty; orig_break_ty ]; _ })
+        ->
+          let new_cont_ty, new_break_ty =
+            update_loop_body_ret_tys orig_cont_ty orig_break_ty
+          in
+          mk_loop_result_ty new_cont_ty new_break_ty
+      | _ -> [%internal_error] span
+    else mk_simpl_tuple_ty [ mk_state_ty; inner_ty ]
+  in
+
+  let update_result_ty (in_loop_body_tail : bool) (ty : ty) : ty =
+    if in_loop_body_tail then
+      match opt_destruct_result span ty with
+      | Some inner_ty -> mk_result_ty (update_result_inner_ty true inner_ty)
+      | None -> [%internal_error] span
+    else add_state_to_result_ty span ty
+  in
+
   (* Update the signature *)
   let sg = def.signature in
   let sg =
-    { sg with inputs = Option.to_list fuel_ty @ sg.inputs; output = sg.output }
+    {
+      sg with
+      inputs = Option.to_list fuel_ty @ sg.inputs @ Option.to_list st_ty;
+      output =
+        (if effekt.stateful then update_result_ty is_loop_body sg.output
+         else sg.output);
+    }
   in
   let def = { def with signature = sg } in
 
+  let lookup_fun_decl (fid' : fun_decl_id) (lp_id : (loop_id * bool) option) :
+      fun_decl =
+    match lp_id with
+    | None -> FunDeclId.Map.find fid' ctx.fun_decls
+    | Some (lp_id, is_body) ->
+        [%sanity_check] span (fid' = def.def_id);
+        LoopId.Map.find lp_id (if is_body then bodies else loops)
+  in
+
+  let lookup_llbc_call_info (f : texpr) (args : texpr list) fid lp_id :
+      fun_effect_info * bool =
+    match fid with
+    | FunId fid' ->
+        let def' = lookup_fun_decl fid' lp_id in
+        [%ldebug
+          "def'.signature.inputs:\n"
+          ^ Print.list_to_string (ty_to_string ctx) def'.signature.inputs];
+        (* This should be a full application *)
+        [%sanity_check] span
+          (List.length args = List.length def'.signature.inputs);
+        let is_body_decl =
+          match lp_id with
+          | Some (_, is_body) -> is_body
+          | None -> false
+        in
+        (def'.signature.fwd_info.effect_info, is_body_decl)
+    | TraitMethod (trait_ref, method_id) ->
+        [%sanity_check] span (lp_id = None);
+        let f_inputs, _ = destruct_arrows f.ty in
+        [%sanity_check] span (List.length args = List.length f_inputs);
+        let info =
+          [%silent_unwrap] span
+            (FunsAnalysis.lookup_fun_info ctx.trans_ctx.fun_ctx.fun_infos
+               (LlbcAst.FunOrMethodId.Method
+                  (trait_ref.trait_decl_ref.trait_decl_id, method_id)))
+        in
+        let effect' : fun_effect_info =
+          {
+            stateful_group = info.stateful;
+            stateful = info.stateful;
+            can_fail = info.can_fail;
+            can_diverge = info.can_diverge;
+            is_rec = info.is_rec;
+          }
+        in
+        (effect', false)
+  in
+
   (* Small helper: update a call by adding the fuel and state parameters, return
-     the updated expession together with the new state *)
-  let update_call (f : texpr) (args : texpr list) (fuel : texpr option) : texpr
-      =
+     the updated expression together with the new state pattern and expr *)
+  let update_call ~(is_body_decl : bool) (f : texpr) (args : texpr list)
+      (fuel : texpr option) (st : texpr option) :
+      texpr * tpat option * texpr option =
     (* We need to update the type of the function *)
     let inputs, output = destruct_arrows f.ty in
     let fuel_ty = Option.map (fun (v : texpr) -> v.ty) fuel in
-    let inputs = Option.to_list fuel_ty @ inputs in
+    let st_ty = Option.map (fun (v : texpr) -> v.ty) st in
+    let inputs = Option.to_list fuel_ty @ inputs @ Option.to_list st_ty in
+    let output =
+      match st with
+      | None -> output
+      | Some _ -> update_result_ty is_body_decl output
+    in
     let f = { f with ty = mk_arrows inputs output } in
 
     (* Put everything together *)
-    let e = [%add_loc] mk_apps span f (Option.to_list fuel @ args) in
+    let st' = Option.map (fun _ -> mk_fresh_state_var ctx) st in
+    let st'_expr = Option.map mk_texpr_from_fvar st' in
+    let st'_pat = Option.map (mk_tpat_from_fvar None) st' in
+    let e =
+      [%add_loc] mk_apps span f (Option.to_list fuel @ args @ Option.to_list st)
+    in
 
     (* Return *)
-    e
+    (e, st'_pat, st'_expr)
+  in
+
+  let wrap_pure_monadic_with_state (cur_st : texpr) (e : texpr) : texpr =
+    match opt_destruct_result span e.ty with
+    | None -> [%internal_error] span
+    | Some res_ty ->
+        let res_var =
+          { id = ctx.fresh_fvar_id (); basename = None; ty = res_ty }
+        in
+        let res_pat = mk_tpat_from_fvar None res_var in
+        let res_expr = mk_texpr_from_fvar res_var in
+        let tuple = mk_simpl_tuple_texpr span [ cur_st; res_expr ] in
+        let ok_expr = mk_result_ok_texpr span tuple in
+        mk_opened_let true res_pat e ok_expr
+  in
+
+  let rec update_loop_result (orig_cont_ty : ty) (new_cont_ty : ty)
+      (new_break_ty : ty) (cur_st : texpr) (e : texpr) : texpr =
+    match e.e with
+    | Switch (scrut, If (e1, e2)) ->
+        let e1 =
+          update_loop_result orig_cont_ty new_cont_ty new_break_ty cur_st e1
+        in
+        let e2 =
+          update_loop_result orig_cont_ty new_cont_ty new_break_ty cur_st e2
+        in
+        { e = Switch (scrut, If (e1, e2)); ty = e1.ty }
+    | Switch (scrut, Match branches) ->
+        let branches =
+          List.map
+            (fun (b : match_branch) ->
+              {
+                b with
+                branch =
+                  update_loop_result orig_cont_ty new_cont_ty new_break_ty
+                    cur_st b.branch;
+              })
+            branches
+        in
+        {
+          e = Switch (scrut, Match branches);
+          ty = (List.hd branches).branch.ty;
+        }
+    | Meta (m, e') ->
+        mk_emeta m
+          (update_loop_result orig_cont_ty new_cont_ty new_break_ty cur_st e')
+    | _ -> (
+        let f, args = destruct_apps e in
+        match f.e with
+        | Qualif
+            {
+              id =
+                AdtCons
+                  {
+                    adt_id = TBuiltin TLoopResult;
+                    variant_id = Some variant_id;
+                  } as id;
+              generics;
+            } ->
+            [%sanity_check] span (List.length args = 1);
+            let arg = List.hd args in
+            let new_arg =
+              if variant_id = loop_result_continue_id then
+                if ty_is_unit orig_cont_ty then cur_st
+                else mk_simpl_tuple_texpr span [ arg; cur_st ]
+              else (
+                [%sanity_check] span (variant_id = loop_result_break_id);
+                mk_simpl_tuple_texpr span [ cur_st; arg ])
+            in
+            let generics =
+              { generics with types = [ new_cont_ty; new_break_ty ] }
+            in
+            let out_ty = mk_loop_result_ty new_cont_ty new_break_ty in
+            let f =
+              { e = Qualif { id; generics }; ty = mk_arrow new_arg.ty out_ty }
+            in
+            [%add_loc] mk_app span f new_arg
+        | _ -> [%internal_error] span)
+  in
+
+  let open_lambda_one (e : texpr) : tpat * texpr =
+    match e.e with
+    | Lambda (pat, body) ->
+        if tpat_is_open pat then (pat, body)
+        else
+          let _, pat, body = open_binder ctx span pat body in
+          (pat, body)
+    | _ -> [%internal_error] span
   in
 
   (* Update the body *)
-  let rec update (fuel : texpr option) (e : texpr) : texpr =
+  let rec update (fuel : texpr option) (st : texpr option)
+      (in_loop_body_tail : bool) (e : texpr) : texpr =
     [%ldebug "e:\n" ^ texpr_to_string ctx e];
+    let update_loop_op (generics : generic_args) (args : texpr list)
+        (st : texpr option) : texpr * tpat option * texpr option =
+      [%sanity_check] span (List.length generics.types = 2);
+      [%sanity_check] span (List.length args = 2);
+      let orig_cont_ty, orig_break_ty =
+        match generics.types with
+        | [ c; b ] -> (c, b)
+        | _ -> [%internal_error] span
+      in
+      let body_lam, init_arg =
+        match args with
+        | [ l; i ] -> (l, i)
+        | _ -> [%internal_error] span
+      in
+      let orig_pat, orig_lam_body = open_lambda_one body_lam in
+      let init_arg = update None None false init_arg in
+      let body_is_stateful =
+        texpr_contains_stateful_call ~loops ~bodies ctx orig_lam_body
+      in
+      if not body_is_stateful then
+        let lam = mk_opened_lambda span orig_pat orig_lam_body in
+        let ty =
+          mk_arrows [ lam.ty; init_arg.ty ] (mk_result_ty orig_break_ty)
+        in
+        let f = { e = Qualif { id = LoopOp; generics }; ty } in
+        ([%add_loc] mk_apps span f [ lam; init_arg ], None, None)
+      else (
+        [%sanity_check] span (Option.is_some st);
+        let cur_st = Option.get st in
+        let st_loop = mk_fresh_state_var ctx in
+        let st_loop_expr = mk_texpr_from_fvar st_loop in
+        let st_loop_pat = mk_tpat_from_fvar None st_loop in
+        let new_lam_body = update fuel (Some st_loop_expr) true orig_lam_body in
+        let new_cont_ty, new_break_ty =
+          update_loop_body_ret_tys orig_cont_ty orig_break_ty
+        in
+        let new_lam_pat, new_lam_body, new_init =
+          if ty_is_unit orig_cont_ty then
+            let new_lam_body =
+              match orig_pat.pat with
+              | PIgnored | PAdt { variant_id = None; fields = [] } ->
+                  new_lam_body
+              | _ -> mk_opened_let false orig_pat mk_unit_texpr new_lam_body
+            in
+            (st_loop_pat, new_lam_body, cur_st)
+          else
+            ( mk_simpl_tuple_pat [ orig_pat; st_loop_pat ],
+              new_lam_body,
+              mk_simpl_tuple_texpr span [ init_arg; cur_st ] )
+        in
+        let new_lam = mk_opened_lambda span new_lam_pat new_lam_body in
+        let new_generics =
+          { generics with types = [ new_cont_ty; new_break_ty ] }
+        in
+        let ty =
+          mk_arrows [ new_lam.ty; new_init.ty ] (mk_result_ty new_break_ty)
+        in
+        let f = { e = Qualif { id = LoopOp; generics = new_generics }; ty } in
+        let call = [%add_loc] mk_apps span f [ new_lam; new_init ] in
+        let st' = mk_fresh_state_var ctx in
+        let st'_pat = mk_tpat_from_fvar None st' in
+        let st'_expr = mk_texpr_from_fvar st' in
+        (call, Some st'_pat, Some st'_expr))
+    in
     match e.e with
     | FVar _ | BVar _ | CVar _ | Const _ -> e
-    | App _ | Qualif _ ->
-        (* We treat function calls, [Result::ok], [Result::fail] here *)
+    | App _ | Qualif _ -> (
+        (* We treat function calls, [LoopOp], [Result::ok], [Result::fail] here *)
         let f, args = destruct_apps e in
-        (* The arguments *must* be pure (which means they can not be stateful
-         nor divergent) *)
-        let args = List.map (update None) args in
         [%ldebug
           "- f: " ^ texpr_to_string ctx f ^ "\n- args:\n"
           ^ Print.list_to_string (texpr_to_string ctx) args];
-        (* *)
-        begin
-          match f.e with
-          | Qualif { id = FunOrOp (Fun (FromLlbc (FunId fid', lp_id))); _ } ->
-              (* Lookup the decl *)
-              let def' : fun_decl =
-                match lp_id with
-                | None -> FunDeclId.Map.find fid' ctx.fun_decls
-                | Some (lp_id, _) ->
-                    [%sanity_check] span (fid' = def.def_id);
-                    LoopId.Map.find lp_id loops
-              in
-              [%ldebug
-                "def'.signature.inputs:\n"
-                ^ Print.list_to_string (ty_to_string ctx) def'.signature.inputs];
-              (* This should be a full application *)
-              [%sanity_check] span
-                (List.length args = List.length def'.signature.inputs);
+        match f.e with
+        | Qualif { id = FunOrOp (Fun (FromLlbc (fid, lp_id))); _ } ->
+            (* The arguments *must* be pure (which means they can not be stateful
+               nor divergent) *)
+            let args = List.map (update None None false) args in
+            let effect', is_body_decl =
+              lookup_llbc_call_info f args fid lp_id
+            in
 
-              (* Add the fuel and the state parameters. *)
-              let effect' = def'.signature.fwd_info.effect_info in
-              [%sanity_check] span
-                ((not effect'.can_diverge) || (not !Config.use_fuel)
-               || Option.is_some fuel);
-              let fuel = if effect'.can_diverge then fuel else None in
-              let call = update_call f args fuel in
-              call
-          | _ -> [%add_loc] mk_apps span f args
-        end
-    | Lambda _ -> e
-    | Let (monadic, lv, re, next) ->
+            (* Add the fuel and the state parameters. *)
+            [%sanity_check] span
+              ((not effect'.can_diverge) || (not !Config.use_fuel)
+             || Option.is_some fuel);
+            let fuel = if effect'.can_diverge then fuel else None in
+            [%sanity_check] span ((not effect'.stateful) || Option.is_some st);
+            [%sanity_check] span ((not in_loop_body_tail) || is_body_decl);
+            let st_for_call = if effect'.stateful then st else None in
+            let call, _, _ =
+              update_call ~is_body_decl f args fuel st_for_call
+            in
+            if Option.is_some st && not effect'.stateful then
+              wrap_pure_monadic_with_state (Option.get st) call
+            else call
+        | Qualif { id = LoopOp; generics } ->
+            let call, st'_pat, _ = update_loop_op generics args st in
+            if Option.is_some st && Option.is_none st'_pat then
+              wrap_pure_monadic_with_state (Option.get st) call
+            else call
+        | Qualif
+            {
+              id =
+                AdtCons
+                  { adt_id = TBuiltin TResult; variant_id = Some variant_id } as
+                id;
+              generics;
+            } -> (
+            let args = List.map (update None None false) args in
+            match st with
+            | Some cur_st ->
+                [%sanity_check] span (List.length generics.types = 1);
+                [%sanity_check] span (List.length args = 1);
+                let arg = List.hd args in
+                if variant_id = result_ok_id then
+                  let new_arg =
+                    if in_loop_body_tail then
+                      let orig_cont_ty, orig_break_ty =
+                        match List.hd generics.types with
+                        | TAdt (TBuiltin TLoopResult, { types = [ c; b ]; _ })
+                          -> (c, b)
+                        | _ -> [%internal_error] span
+                      in
+                      let new_cont_ty, new_break_ty =
+                        update_loop_body_ret_tys orig_cont_ty orig_break_ty
+                      in
+                      update_loop_result orig_cont_ty new_cont_ty new_break_ty
+                        cur_st arg
+                    else mk_simpl_tuple_texpr span [ cur_st; arg ]
+                  in
+                  let qualif =
+                    { id; generics = { generics with types = [ new_arg.ty ] } }
+                  in
+                  let output = mk_result_ty new_arg.ty in
+                  let f =
+                    { e = Qualif qualif; ty = mk_arrow new_arg.ty output }
+                  in
+                  [%add_loc] mk_app span f new_arg
+                else (
+                  [%sanity_check] span (variant_id = result_fail_id);
+                  let input, _ = destruct_arrow span f.ty in
+                  let new_inner_ty =
+                    update_result_inner_ty in_loop_body_tail
+                      (List.hd generics.types)
+                  in
+                  let output = mk_result_ty new_inner_ty in
+                  let qualif =
+                    {
+                      id;
+                      generics = { generics with types = [ new_inner_ty ] };
+                    }
+                  in
+                  let f = { e = Qualif qualif; ty = mk_arrow input output } in
+                  [%add_loc] mk_app span f arg)
+            | None -> [%add_loc] mk_apps span f args)
+        | _ -> (
+            let args = List.map (update None None false) args in
+            let call = [%add_loc] mk_apps span f args in
+            match st with
+            | Some cur_st when not in_loop_body_tail ->
+                if Option.is_some (opt_destruct_result span call.ty) then
+                  wrap_pure_monadic_with_state cur_st call
+                else call
+            | _ -> call))
+    | Lambda _ ->
+        [%cassert] span
+          (not (texpr_contains_stateful_call ~loops ~bodies ctx e))
+          "Stateful lambdas are not supported";
+        e
+    | Let (monadic, lv, re, next) -> (
         (* Is it a function/loop call? *)
         let f, args = destruct_apps re in
-        begin
-          match f.e with
-          | Qualif { id = FunOrOp (Fun (FromLlbc (FunId fid', lp_id))); _ } ->
-              (* Lookup the decl *)
-              let def' : fun_decl =
-                match lp_id with
-                | None -> FunDeclId.Map.find fid' ctx.fun_decls
-                | Some (lp_id, _) ->
-                    [%sanity_check] span (fid' = def.def_id);
-                    LoopId.Map.find lp_id loops
-              in
-              (* This should be a full application *)
-              [%sanity_check] span
-                (List.length args = List.length def'.signature.inputs);
+        match f.e with
+        | Qualif { id = FunOrOp (Fun (FromLlbc (fid, lp_id))); _ } ->
+            let args = List.map (update None None false) args in
+            let effect', is_body_decl =
+              lookup_llbc_call_info f args fid lp_id
+            in
 
-              (* Add the fuel and the state parameters. *)
-              let call =
-                let effect' = def'.signature.fwd_info.effect_info in
-                let fuel' = if effect'.can_diverge then fuel else None in
+            (* Add the fuel and the state parameters. *)
+            let fuel' = if effect'.can_diverge then fuel else None in
+            let st' = if effect'.stateful then st else None in
 
-                [%sanity_check] span
-                  ((not effect'.can_diverge) || (not !Config.use_fuel)
-                 || Option.is_some fuel');
+            [%sanity_check] span ((not effect'.stateful) || effekt.stateful);
+            [%sanity_check] span ((not effect'.stateful) || Option.is_some st');
+            [%sanity_check] span
+              ((not effect'.can_diverge) || (not !Config.use_fuel)
+             || Option.is_some fuel');
 
-                update_call f args fuel'
-              in
+            let call, st_pat, nstate =
+              update_call ~is_body_decl f args fuel' st'
+            in
+            let st_for_next =
+              match nstate with
+              | None -> st
+              | Some nstate -> Some nstate
+            in
 
-              (* Update the let binding *)
-              let next = update fuel next in
-              mk_opened_let monadic lv call next
-          | _ ->
-              let re = update fuel re in
-              let next = update fuel next in
+            (* Update the let binding *)
+            let next = update fuel st_for_next in_loop_body_tail next in
+            let lv = mk_simpl_tuple_pat (Option.to_list st_pat @ [ lv ]) in
+            mk_opened_let monadic lv call next
+        | Qualif { id = LoopOp; generics } ->
+            let call, st_pat, nstate = update_loop_op generics args st in
+            let st_for_next =
+              match nstate with
+              | None -> st
+              | Some nstate -> Some nstate
+            in
+            let next = update fuel st_for_next in_loop_body_tail next in
+            let lv = mk_simpl_tuple_pat (Option.to_list st_pat @ [ lv ]) in
+            mk_opened_let monadic lv call next
+        | _ ->
+            (* Check if the bound expression contains a stateful call: if yes,
+               it introduces a new state *)
+            let re_is_stateful =
+              texpr_contains_stateful_call ~loops ~bodies ctx re
+            in
+            [%sanity_check] span ((not re_is_stateful) || Option.is_some st);
+            if re_is_stateful then
+              let re = update fuel st false re in
+              let st' = mk_fresh_state_var ctx in
+              let st'_expr = mk_texpr_from_fvar st' in
+              let st'_pat = mk_tpat_from_fvar None st' in
+              let lv = mk_simpl_tuple_pat [ st'_pat; lv ] in
+              let next = update fuel (Some st'_expr) in_loop_body_tail next in
               mk_opened_let monadic lv re next
-        end
+            else
+              let re = update fuel None false re in
+              let next = update fuel st in_loop_body_tail next in
+              mk_opened_let monadic lv re next)
     | Switch (scrut, If (e1, e2)) ->
         (* The scrutinee must be pure *)
-        let scrut = update None scrut in
-        (* *)
-        let e1 = update fuel e1 in
-        let e2 = update fuel e2 in
+        let scrut = update None None false scrut in
+        let e1 = update fuel st in_loop_body_tail e1 in
+        let e2 = update fuel st in_loop_body_tail e2 in
         { e = Switch (scrut, If (e1, e2)); ty = e1.ty }
     | Switch (scrut, Match branches) ->
         (* The scrutinee must be pure *)
-        let scrut = update None scrut in
-        (* *)
+        let scrut = update None None false scrut in
         let branches =
           List.map
-            (fun (b : match_branch) -> { b with branch = update fuel b.branch })
+            (fun (b : match_branch) ->
+              { b with branch = update fuel st in_loop_body_tail b.branch })
             branches
         in
-        (* *)
         {
           e = Switch (scrut, Match branches);
           ty = (List.hd branches).branch.ty;
@@ -3213,15 +3626,24 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
         (* Loops should have been eliminated by then *)
         [%internal_error] span
     | StructUpdate _ -> e
-    | Meta (m, e') -> mk_emeta m e'
-    | EError _ -> e
+    | Meta (m, e') ->
+        let e' =
+          if Option.is_some st || !Config.effectful_patterns <> [] then
+            update fuel st in_loop_body_tail e'
+          else e'
+        in
+        mk_emeta m e'
+    | EError _ ->
+        if Option.is_some st && Option.is_some (opt_destruct_result span e.ty)
+        then { e with ty = update_result_ty in_loop_body_tail e.ty }
+        else e
   in
   let body =
     Option.map
       (fun (body : fun_body) ->
         let { body; inputs } = body in
         (* Update the body *)
-        let body = update fuel_expr body in
+        let body = update fuel_expr st_expr is_loop_body body in
         (* Wrap it in a match over the fuel if necessary *)
         let body, fuel_input =
           if effekt.is_rec && !Config.use_fuel then
@@ -3233,7 +3655,8 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
         (* Update the inputs *)
         let inputs =
           let fuel_pat = Option.map (mk_tpat_from_fvar None) fuel_input in
-          Option.to_list fuel_pat @ inputs
+          let st_pat = Option.map (mk_tpat_from_fvar None) st in
+          Option.to_list fuel_pat @ inputs @ Option.to_list st_pat
         in
         (* *)
         { body; inputs })
@@ -3244,18 +3667,82 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
   let body = Option.map (close_all_fun_body span) body in
   { def with body }
 
-let add_fuel (ctx : ctx) (trans : pure_fun_translation) : pure_fun_translation =
+let add_fuel_and_state (ctx : ctx) (trans : pure_fun_translation) :
+    pure_fun_translation =
+  let loops, bodies =
+    if !Config.effectful_patterns = [] then (trans.loops, trans.bodies)
+    else
+      let stateful_loops = ref LoopId.Set.empty in
+      let stateful_bodies = ref LoopId.Set.empty in
+      let decl_has_stateful_call (d : fun_decl) : bool =
+        match d.body with
+        | None -> d.signature.fwd_info.effect_info.stateful
+        | Some body ->
+            expr_contains_stateful_call_aux
+              ~is_loop_stateful:(fun _fid lp_id is_body ->
+                let set =
+                  if is_body then !stateful_bodies else !stateful_loops
+                in
+                LoopId.Set.mem lp_id set)
+              ctx body.body
+      in
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        List.iter
+          (fun (d : fun_decl) ->
+            let lp_id = fst (Option.get d.loop_id) in
+            if
+              (not (LoopId.Set.mem lp_id !stateful_bodies))
+              && decl_has_stateful_call d
+            then (
+              stateful_bodies := LoopId.Set.add lp_id !stateful_bodies;
+              changed := true))
+          trans.bodies;
+        List.iter
+          (fun (d : fun_decl) ->
+            let lp_id = fst (Option.get d.loop_id) in
+            if
+              (not (LoopId.Set.mem lp_id !stateful_loops))
+              && (LoopId.Set.mem lp_id !stateful_bodies
+                 || decl_has_stateful_call d)
+            then (
+              stateful_loops := LoopId.Set.add lp_id !stateful_loops;
+              changed := true))
+          trans.loops
+      done;
+      let update_decl_stateful (set : LoopId.Set.t) (d : fun_decl) : fun_decl =
+        let lp_id = fst (Option.get d.loop_id) in
+        let stateful = LoopId.Set.mem lp_id set in
+        let sg = d.signature in
+        let fwd_info = sg.fwd_info in
+        let effect_info = { fwd_info.effect_info with stateful } in
+        {
+          d with
+          signature = { sg with fwd_info = { fwd_info with effect_info } };
+        }
+      in
+      ( List.map (update_decl_stateful !stateful_loops) trans.loops,
+        List.map (update_decl_stateful !stateful_bodies) trans.bodies )
+  in
+
   let loops_map =
     LoopId.Map.of_list
-      (List.map
-         (fun (f : fun_decl) -> (fst (Option.get f.loop_id), f))
-         trans.loops)
+      (List.map (fun (f : fun_decl) -> (fst (Option.get f.loop_id), f)) loops)
+  in
+  let bodies_map =
+    LoopId.Map.of_list
+      (List.map (fun (f : fun_decl) -> (fst (Option.get f.loop_id), f)) bodies)
   in
 
   (* Add the fuel and the state *)
-  let f = add_fuel_one ctx loops_map trans.f in
-  let loops = List.map (add_fuel_one ctx loops_map) trans.loops in
-  let bodies = List.map (add_fuel_one ctx loops_map) trans.bodies in
+  let f = add_fuel_and_state_one ctx loops_map bodies_map trans.f in
+  let loops =
+    List.map (add_fuel_and_state_one ctx loops_map bodies_map) loops
+  in
+  let bodies =
+    List.map (add_fuel_and_state_one ctx loops_map bodies_map) bodies
+  in
 
   (* Decompose the monadic let-bindings if necessary (Coq needs this) *)
   let f, loops, bodies =
@@ -3269,6 +3756,29 @@ let add_fuel (ctx : ctx) (trans : pure_fun_translation) : pure_fun_translation =
 
   (* *)
   { f; loops; bodies }
+
+let add_state_to_trait_decl (decl : trait_decl) : trait_decl =
+  let methods =
+    List.map
+      (fun (m : trait_method) ->
+        let sg = m.signature in
+        if sg.fwd_info.effect_info.stateful then
+          let sg =
+            {
+              sg with
+              inputs = sg.inputs @ [ mk_state_ty ];
+              output = add_state_to_result_ty m.item_meta.span sg.output;
+            }
+          in
+          { m with signature = sg }
+        else m)
+      decl.methods
+  in
+  { decl with methods }
+
+let add_state_to_trait_decls (decls : trait_decl list) : trait_decl list =
+  if !Config.effectful_patterns = [] then decls
+  else List.map add_state_to_trait_decl decls
 
 (** Perform the following transformation:
 

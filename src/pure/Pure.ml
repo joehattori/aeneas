@@ -79,6 +79,7 @@ type fvar_id = FVarId.id [@@deriving show, ord]
       don't support semantic termination, in which case we can use a fuel
       parameter to do partial verification) *)
 type builtin_ty =
+  | TState
   | TResult
   | TSum  (** sum type with two variants: left and right *)
   | TLoopResult  (** A continue or a break. TODO: rename to TControlFlow *)
@@ -1595,6 +1596,13 @@ and emeta =
 
 (** Information about the "effect" of a function *)
 type fun_effect_info = {
+  stateful_group : bool;
+      (** [true] if the function declaration group is stateful (for example the
+          forward function is stateful, while backward functions remain
+          non-stateful). *)
+  stateful : bool;
+      (** [true] if the function takes a state as input and outputs an updated
+          state. *)
   can_fail : bool;  (** [true] if the return type is a [result] *)
   can_diverge : bool;
       (** [true] if the function can diverge (i.e., not terminate). It happens
